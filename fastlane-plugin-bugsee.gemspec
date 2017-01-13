@@ -7,10 +7,10 @@ Gem::Specification.new do |spec|
   spec.name          = 'fastlane-plugin-bugsee'
   spec.version       = Fastlane::Bugsee::VERSION
   spec.author        = %q{Dmitry Fink}
-  spec.email         = %q{dmitry@finik.net}
+  spec.email         = %q{finik@bugsee.net}
 
   spec.summary       = %q{Bugsee symbols uploader}
-  # spec.homepage      = "https://github.com/<GITHUB_USERNAME>/fastlane-plugin-bugsee"
+  spec.homepage      = "https://github.com/bugsee/fastlane-plugin-bugsee"
   spec.license       = "MIT"
 
   spec.files         = Dir["lib/**/*"] + %w(README.md LICENSE)
