@@ -37,7 +37,7 @@ module Fastlane
           command << "-x -l #{app_token}"
           command += dsym_paths
           begin
-            Actions.sh(command.join(" "), log: true)
+            Actions.sh(command.join(" "), log: false)
           rescue => ex
             UI.error ex.to_s # it fails, however we don't want to fail everything just for this
           end
