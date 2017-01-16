@@ -1,4 +1,4 @@
-# bugsee plugin
+# Bugsee fastlane plugin
 
 [![fastlane Plugin Badge](https://rawcdn.githack.com/fastlane/fastlane/master/fastlane/assets/plugin-badge.svg)](https://rubygems.org/gems/fastlane-plugin-bugsee)
 
@@ -13,7 +13,7 @@ fastlane add_plugin bugsee
 ## About bugsee
 
 Bugsee is free crash and bug reporting with video, network and logs. Sign up for a service at [https://www.bugsee.com](https://www.bugsee.com). This plugin implements fastlane action to upload debug
-symbol files to Bugsee servers.
+symbol (dSYM) files to Bugsee servers.
 
 ## Usage
 
@@ -30,15 +30,17 @@ end
 ```
 
 For refreshing dSYM files from iTunes connect (bit-code case):
+```
 lane :refresh_dsyms do
   download_dsyms(
-        build_number: "1819" # optional, otherwise it will download all
+        build_number: "1819" # optional, otherwise it will download dSYM for all builds
   ) # Download dSYM files from iTC
   upload_symbols_to_bugsee(
         app_token: "<your bugsee app token>",
   )
   clean_build_artifacts           # Delete the local dSYM files
 end
+```
 
 ## Documentation
 
@@ -46,7 +48,7 @@ Further documentation about Bugsee crash symbolication is available at https://d
 
 ## Issues and Feedback
 
-For any other issues and feedback about this plugin, contact Bugsee support at support@finik.net.
+For any other issues and feedback about this plugin, contact Bugsee support at support@bugsee.net.
 
 ## Troubleshooting
 
