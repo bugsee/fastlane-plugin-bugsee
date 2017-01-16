@@ -12,32 +12,41 @@ fastlane add_plugin bugsee
 
 ## About bugsee
 
-Bugsee symbols uploader
+Bugsee is free crash and bug reporting with video, network and logs. Sign up for a service at [https://www.bugsee.com](https://www.bugsee.com). This plugin implements fastlane action to upload debug
+symbol files to Bugsee servers.
 
-**Note to author:** Add a more detailed description about this plugin here. If your plugin contains multiple actions, make sure to mention them here.
+## Usage
 
-## Example
-
-Check out the [example `Fastfile`](fastlane/Fastfile) to see how to use this plugin. Try it by cloning the repo, running `fastlane install_plugins` and `bundle exec fastlane test`.
-
-**Note to author:** Please set up a sample project to make it easy for users to explore what your plugin does. Provide everything that is necessary to try out the plugin in this project (including a sample Xcode/Android project if necessary)
-
-## Run tests for this plugin
-
-To run both the tests, and code style validation, run
-
+For uploading symbols during build(gym) (non-bitcode case):
 ```
-rake
+lane :mybuildlane do
+  gym(
+        # your settings for the bild
+  )
+  upload_symbols_to_bugsee(
+        app_token: "<your bugsee app token>",
+  )
+end
 ```
 
-To automatically fix many of the styling issues, use
-```
-rubocop -a
-```
+For refreshing dSYM files from iTunes connect (bit-code case):
+lane :refresh_dsyms do
+  download_dsyms(
+        build_number: "1819" # optional, otherwise it will download all
+  ) # Download dSYM files from iTC
+  upload_symbols_to_bugsee(
+        app_token: "<your bugsee app token>",
+  )
+  clean_build_artifacts           # Delete the local dSYM files
+end
+
+## Documentation
+
+Further documentation about Bugsee crash symbolication is available at https://docs.bugsee.com
 
 ## Issues and Feedback
 
-For any other issues and feedback about this plugin, please submit it to this repository.
+For any other issues and feedback about this plugin, contact Bugsee support at support@finik.net.
 
 ## Troubleshooting
 
@@ -47,6 +56,4 @@ If you have trouble using plugins, check out the [Plugins Troubleshooting](https
 
 For more information about how the `fastlane` plugin system works, check out the [Plugins documentation](https://docs.fastlane.tools/plugins/create-plugin/).
 
-## About `fastlane`
 
-`fastlane` is the easiest way to automate beta deployments and releases for your iOS and Android apps. To learn more, check out [fastlane.tools](https://fastlane.tools).
