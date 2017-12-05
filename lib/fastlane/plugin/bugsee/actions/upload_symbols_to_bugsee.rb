@@ -21,6 +21,7 @@ module Fastlane
 
         version = params[:version]
         build = params[:build]
+        symbol_maps = params[:symbol_maps]
 
         dsym_paths.each do |path|
           print(path)
@@ -34,6 +35,7 @@ module Fastlane
           command << "-e #{host}"
           command << "-v #{version}" if version
           command << "-b #{build}" if build
+          command << "-m #{maps}" if symbol_maps
           command << "-x -l #{app_token}"
           command += dsym_paths
           begin
@@ -85,6 +87,10 @@ module Fastlane
                                        env_name: "BUGSEE_DSYM_PATH",
                                        description: "Path to а symbol file",
                                        default_value: Actions.lane_context[SharedValues::DSYM_OUTPUT_PATH],
+                                       optional: true),
+          FastlaneCore::ConfigItem.new(key: :symbol_maps,
+                                       env_name: "BUGSEE_MAPS_PATH",
+                                       description: "Path to а folder containing BCSymbolMaps",
                                        optional: true),
           FastlaneCore::ConfigItem.new(key: :version,
                                        env_name: "BUGSEE_APP_VERSION",
