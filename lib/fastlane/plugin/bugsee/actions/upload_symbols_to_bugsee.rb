@@ -103,7 +103,11 @@ module Fastlane
                                        env_name: "BUGSEE_APP_BUILD",
                                        description: "Application build number",
                                        default_value: Actions.lane_context[SharedValues::BUILD_NUMBER],
-                                       optional: true)
+                                       optional: true),
+          FastlaneCore::ConfigItem.new(key: :build_dir,
+                                        env_name: "TARGET_BUILD_DIR",
+                                        description: "Target build directory",
+                                        optional: true)
         ]
       end
 
