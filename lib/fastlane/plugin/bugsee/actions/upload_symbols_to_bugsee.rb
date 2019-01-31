@@ -6,6 +6,7 @@ module Fastlane
         app_token = params[:app_token]
         host = params[:host] || "https://api.bugsee.com"
         agent_path = params[:agent_path] || Dir["./**/BugseeAgent"].first
+        build_dir = params[:build_dir] || "./"
 
         UI.user_error!("Please provide an app token using app_token:") unless app_token
         UI.user_error!("Please provide a path to BugseeAgent helper script:") unless agent_path
@@ -35,6 +36,7 @@ module Fastlane
           command << "-e #{host}"
           command << "-v #{version}" if version
           command << "-b #{build}" if build
+          command << "-d #{build_dir}"
           command << "-m #{maps}" if symbol_maps
           command << "-x -l #{app_token}"
           command += dsym_paths
