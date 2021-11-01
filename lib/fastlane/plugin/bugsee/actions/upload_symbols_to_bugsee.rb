@@ -2,10 +2,14 @@ module Fastlane
   module Actions
 
     class UploadSymbolsToBugseeAction < Action
+
+      BUGSEE_AGENT_PATH = File.expand_path(
+        File.join(File.dirname(__FILE__), '..', '..', '..', '..', '..', 'BugseeAgent'))
+
       def self.run(params)
         app_token = params[:app_token]
         host = params[:host] || "https://api.bugsee.com"
-        agent_path = params[:agent_path] || Dir["./**/BugseeAgent"].first
+        agent_path = params[:agent_path] || BUGSEE_AGENT_PATH
         build_dir = params[:build_dir] || "./"
 
         UI.user_error!("Please provide an app token using app_token:") unless app_token
