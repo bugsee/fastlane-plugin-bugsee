@@ -1,6 +1,6 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 
-# Copyright 2019 Bugsee, Inc. All rights reserved.
+# Copyright 2016-2023 Bugsee. All rights reserved.
 #
 # Usage:
 #   * Start editing your scheme by going to Product -> Scheme -> Edit Scheme
@@ -14,7 +14,7 @@
 #   echo "Error: Bugsee build phase script not found. Make sure that you're including Bugsee.bundle in your project directory"
 #   exit 1
 # fi
-# /usr/bin/python "${SCRIPT_SRC}" <APP_TOKEN>
+# python3 "${SCRIPT_SRC}" <APP_TOKEN>
 # --- INVOCATION SCRIPT END ---
 
 import os
@@ -22,7 +22,7 @@ import subprocess
 import zipfile
 import tempfile
 import sys
-import urllib2
+import urllib.request, urllib.error, urllib.parse
 import re
 import json
 import hashlib
@@ -37,7 +37,7 @@ def isInUploadedList(images, imageList):
     return False
 
 def saveUploadedList(images):
-    print "Storing identifiers so we won't upload them again"
+    print("Storing identifiers so we won't upload them again")
     with open(os.path.expanduser("~/.bugseeUploadList"), 'w+') as data_file:
         json.dump(images, data_file)
     return
@@ -52,7 +52,7 @@ def loadUploadedList():
 def parseDSYM(fullPath):
     images = []
     try:
-        out = subprocess.check_output(["/usr/bin/dwarfdump", "-u", fullPath], stderr=None)
+        out = subprocess.run(['/usr/bin/dwarfdump', '-u', fullPath], check=True, capture_output=True, text=True).stdout
         # UUID: 598A8EC3-B348-36C6-8B3A-0390B247EFF2 (arm64) /Users/finik/Downloads/BugseeDev
         lines = out.splitlines()
 
@@ -68,7 +68,7 @@ def parseDSYM(fullPath):
 
 def deobfuscateDSYM(fullPath, mapsPath):
     try:
-        out = subprocess.check_output(["/usr/bin/dsymutil", "--symbol-map", mapsPath, fullPath], stderr=None)
+        out = subprocess.run(['/usr/bin/dsymutil', '--symbol-map', mapsPath, fullPath], check=True, capture_output=True, text=True).stdout
     except subprocess.CalledProcessError as e:
         return
     return
@@ -122,11 +122,10 @@ def getVersionAndBuild(zipFile):
     else:
         try:
             info_file_path = os.path.join(options.build_dir, os.environ['INFOPLIST_PATH'])
-            p = subprocess.Popen('/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" -c "Print :CFBundleVersion" "%s"' % info_file_path,
-                             stdout=subprocess.PIPE, shell=True)
-
+            cmd = '/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" -c "Print :CFBundleVersion" "' + info_file_path + '"'
+            p = subprocess.Popen([cmd], stdout=subprocess.PIPE, shell=True)
             stdout, stderr = p.communicate()
-            version, build = stdout.split()
+            version, build = stdout.decode().split()
         except Exception as error:
             return (None, None)
 
@@ -135,9 +134,9 @@ def getVersionAndBuild(zipFile):
 def uncrushIcon(icon, tempDir):
     try:
         dest = os.path.join(tempDir, 'icon.png')
-        print "Uncrushing Icon PNG file to %s" % dest
+        print("Uncrushing Icon PNG file to %s" % dest)
         cmd = '/usr/bin/xcrun pngcrush -revert-iphone-optimizations "'+ icon + '" "' + dest + '"'
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, shell=True)
+        p = subprocess.Popen([cmd], stdout=subprocess.PIPE, shell=True)
 
         stdout, stderr = p.communicate()
     except Exception as error:
@@ -146,37 +145,43 @@ def uncrushIcon(icon, tempDir):
     return dest
 
 def requestEndPoint(version, build):
-    data = json.dumps({
+    encoded_data = json.dumps({
         'version': version,
         'build': build
-        })
+        }).encode()
 
-    req = urllib2.Request(options.endpoint + '/apps/' + APP_TOKEN + '/symbols', data, {'Content-Type': 'application/json'})
-    f = urllib2.urlopen(req)
-    response = f.read()
-    f.close()
-    return json.loads(response)
+    req = urllib.request.Request(options.endpoint + '/apps/' + APP_TOKEN + '/symbols', data=encoded_data)
+    req.add_header('Content-Type', 'application/json')
+    response = urllib.request.urlopen(req)
+
+    text = response.read()
+
+    return json.loads(text.decode())
 
 def uploadBundle(endpoint, filePath):
     # TODO: Change it to urllib2 as well
-    p = subprocess.Popen('curl -v -T "%s" "%s"' % (filePath, endpoint) + ' --write-out %{http_code} --silent --output /dev/null', 
+    cmd = 'curl -v -T "' + filePath + '" "' + endpoint + '"' + ' --write-out %{http_code} --silent --output /dev/null'
+    p = subprocess.Popen([cmd], 
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
     stdout, stderr = p.communicate()
-    if stdout == '200':
+    code = stdout.decode()
+    if code == '200':
         return True
 
     return False
 
 def updateStatus(symbolId):
-    data = json.dumps({
+    encoded_data = json.dumps({
         'status': 'uploading',
-        })
+        }).encode()
 
-    req = urllib2.Request(options.endpoint + '/symbols/' + symbolId + '/status', data, {'Content-Type': 'application/json'})
-    f = urllib2.urlopen(req)
-    response = f.read()
-    f.close()
-    r = json.loads(response)
+    req = urllib.request.Request(options.endpoint + '/symbols/' + symbolId + '/status', data=encoded_data)
+    req.add_header('Content-Type', 'application/json')
+    response = urllib.request.urlopen(req)
+
+    text = response.read()
+
+    r = json.loads(text.decode())
     if (r and r.get('ok')):
         return True
     return False
@@ -190,14 +195,20 @@ def uploadZipFile(zipFileLocation):
 
     r = requestEndPoint(version, build)
     if (r.get('ok') and r.get('endpoint')):
-        print "Uploading to %s" % r.get('endpoint')
-        return uploadBundle(r.get('endpoint'), zipFileLocation)
+        print("Uploading to %s" % r.get('endpoint'))
+        retries = 0
+        while retries < 5:
+            upload_result = uploadBundle(r.get('endpoint'), zipFileLocation)
+            if upload_result:
+                return True
+            print("Uploading to %s failed. Retrying" % r.get('endpoint'))
+            retries += 1
 
     return False
 
 def main():
     tempDir = tempfile.mkdtemp()
-    print "Processing in " + tempDir
+    print("Processing in " + tempDir)
     zipFileLocation = os.path.join(tempDir, 'symbols.zip')
     dwarfs = []
     uploadedImages = loadUploadedList()
@@ -217,7 +228,7 @@ def main():
         if not root.endswith('dSYM/Contents/Resources/DWARF'):
             continue
 
-        print root
+        print(root)
         for f in files:
             if (os.path.islink(os.path.join(root, f))):
                 continue
@@ -227,7 +238,7 @@ def main():
             if (len(images) == 0):
                 continue
             if isInUploadedList(images, uploadedImages):
-                print "Already uploaded %s, skipping" % f
+                print("Already uploaded %s, skipping" % f)
                 continue
             if options.symbol_maps:
                 deobfuscateDSYM(os.path.join(root, f), options.symbol_maps)
@@ -285,8 +296,8 @@ if __name__ == "__main__":
             if pid > 0:
                 # exit first parent
                 sys.exit(0) 
-        except OSError, e: 
-            print >>sys.stderr, "fork #1 failed: %d (%s)" % (e.errno, e.strerror) 
+        except OSError as e: 
+            print("fork #1 failed: %d (%s)" % (e.errno, e.strerror), file=sys.stderr) 
             sys.exit(1)
 
         # decouple from parent environment
@@ -299,36 +310,36 @@ if __name__ == "__main__":
             pid = os.fork() 
             if pid > 0:
                 # exit from second parent, print eventual PID before
-                print "Daemon PID %d" % pid 
+                print("Daemon PID %d" % pid) 
                 sys.exit(0) 
-        except OSError, e: 
-            print >>sys.stderr, "fork #2 failed: %d (%s)" % (e.errno, e.strerror) 
+        except OSError as e: 
+            print("fork #2 failed: %d (%s)" % (e.errno, e.strerror), file=sys.stderr) 
             sys.exit(1)
 
         # redirect standard file descriptors
         outputFile = os.path.join(os.environ['PROJECT_TEMP_DIR'], "BugseeAgent.log")
         # this log will not show since xcode 10
-        print "Detaching STDOUT, logs can be found in %s" % (outputFile)
+        print("Detaching STDOUT, logs can be found in %s" % (outputFile))
         sys.stdout.flush()
         sys.stderr.flush()
-        si = file("/dev/null", 'r')
-        so = file(outputFile, 'w+')
-        se = file("/dev/null", 'w+', 0)
+        si = open("/dev/null", 'r')
+        so = open(outputFile, 'w+')
+        se = open("/dev/null", 'w')
         os.dup2(si.fileno(), sys.stdin.fileno())
         os.dup2(so.fileno(), sys.stdout.fileno())
         os.dup2(se.fileno(), sys.stderr.fileno())
 
         if os.environ.get('DEBUG_INFORMATION_FORMAT') != 'dwarf-with-dsym':
-            print "Bugsee:  DEBUG_INFORMATION_FORMAT is not set. Have you enabled debug symbols in your build? See: https://docs.bugsee.com/sdk/ios/symbolication/"
+            print("Bugsee:  DEBUG_INFORMATION_FORMAT is not set. Have you enabled debug symbols in your build? See: https://docs.bugsee.com/sdk/ios/symbolication/")
             exit(0)
 
         if os.environ.get('EFFECTIVE_PLATFORM_NAME') == '-iphonesimulator':
-            print "Bugsee:  Bugsee is not supoorted in iOS simulator. Will not upload debug symbols for i386!"
+            print("Bugsee:  Bugsee is not supoorted in iOS simulator. Will not upload debug symbols for i386!")
             exit(0)
 
 
     if (len(args) < 1):
-        print "Bugsee:  Not initialized with app token. Must be passed as a parameter"
+        print("Bugsee:  Not initialized with app token. Must be passed as a parameter")
         exit(1)
 
     APP_TOKEN = args[0]
@@ -340,11 +351,11 @@ if __name__ == "__main__":
     if options.dsym_list:
         dsym_list = args[1:]
         if len(dsym_list) < 1:
-            print "Bugsee:  --list option is provided, but no dSYM files can be found in the command line"
+            print("Bugsee:  --list option is provided, but no dSYM files can be found in the command line")
             exit(1)
     else:
         if not options.dsym_folder:
-            print "Bugsee:  Can not find dSYM folder (expecting either a -f option or DWARF_DSYM_FOLDER_PATH)"
+            print("Bugsee:  Can not find dSYM folder (expecting either a -f option or DWARF_DSYM_FOLDER_PATH)")
             exit(1)
 
     # start the daemon main loop
