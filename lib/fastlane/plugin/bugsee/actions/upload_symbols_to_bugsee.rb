@@ -30,7 +30,7 @@ module Fastlane
 
         dsym_paths.each do |path|
           print(path)
-          UI.user_error!("dSYM does not exist at path: #{path}") unless File.exists?(path)
+          UI.user_error!("dSYM does not exist at path: #{path}") unless File.exist?(path)
         end
 
         if dsym_paths.length > 0
