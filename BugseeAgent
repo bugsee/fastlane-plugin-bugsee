@@ -1188,6 +1188,46 @@ def _find_first_above(start_dir, filename, max_levels=6):
     return None
 
 
+def _collect_all_dependencies_via_cli(cli_binary, project_root,
+                                       product_binary):
+    """Shell to `bugsee-cli ios-deps collect` and parse the JSON.
+
+    Part of the Option-C migration that moved iOS dep parsing to
+    the Rust CLI as the single canonical implementation. The
+    in-process Python parsers below are preserved as a cold-start
+    fallback when the CLI isn't available.
+
+    Returns `(entries, scope_label, truncated)` on success or
+    `None` on any failure (subprocess error, malformed JSON,
+    non-zero exit). The caller falls back to the Python
+    implementation on None.
+    """
+    if not cli_binary or not project_root:
+        return None
+    cmd = [cli_binary, "ios-deps", "collect",
+           "--project-root", project_root]
+    if product_binary:
+        cmd.extend(["--product-binary", product_binary])
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=30, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        if not out:
+            return None
+        data = json.loads(out)
+        return (
+            data.get("entries") or [],
+            data.get("scope_label") or "all",
+            bool(data.get("truncated")),
+        )
+    except (OSError, ValueError):
+        return None
+
+
 def _collect_all_dependencies(project_root):
     """Run every parser against the project root and return the
     merged entry list plus the `(scope_label, truncated)` tuple
@@ -1197,7 +1237,31 @@ def _collect_all_dependencies(project_root):
     source lockfile. In an Xcode build that's `SRCROOT` (or
     `$PROJECT_DIR`); outside Xcode (CLI testing) the caller passes
     the project root explicitly.
+
+    Implementation: prefers `bugsee-cli ios-deps collect` (the
+    single cross-language source of truth, ported from these
+    Python parsers — see `bugsee-cli/src/cli/ios_deps.rs`). Falls
+    back to the in-process Python parsers below when the CLI
+    isn't available. Same migration pattern the VCS resolver
+    landed first.
     """
+    # Resolve binary path up-front — needed for both CLI invocation
+    # (`--product-binary <path>`) and the Python fallback.
+    binary = _resolve_product_binary_path()
+
+    cli_path_opt = None
+    cli_version_opt = None
+    try:
+        cli_path_opt = getattr(options, 'cli_path', None)
+        cli_version_opt = getattr(options, 'cli_version', None)
+    except NameError:
+        pass
+    cli = resolveCli(cli_path_opt, cli_version_opt)
+    if cli:
+        via_cli = _collect_all_dependencies_via_cli(cli, project_root, binary)
+        if via_cli is not None:
+            return via_cli
+
     podfile = _find_first_above(project_root, 'Podfile.lock')
     package_resolved = (
         _find_first_above(project_root, 'Package.resolved')
@@ -1210,7 +1274,6 @@ def _collect_all_dependencies(project_root):
                                           'Package.resolved'))
     )
     cartfile = _find_first_above(project_root, 'Cartfile.resolved')
-    binary = _resolve_product_binary_path()
 
     pods_entries = _parse_podfile_lock(podfile) if podfile else []
     spm_entries  = _parse_package_resolved(package_resolved) if package_resolved else []

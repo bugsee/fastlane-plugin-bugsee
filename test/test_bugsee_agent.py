@@ -1189,6 +1189,164 @@ class TestCollectAllDependencies(unittest.TestCase):
 # every emitted field is part of a cross-platform contract.
 
 
+class TestCollectAllDependenciesViaCli(unittest.TestCase):
+    """Pins the Option-C migration of iOS deps collection to
+    bugsee-cli (the Rust subcommand `bugsee-cli ios-deps collect`).
+    The Python parsers in `_collect_all_dependencies` MUST remain a
+    usable fallback for environments where the CLI isn't available
+    — but when the CLI IS available, its JSON output MUST be
+    honored verbatim (one cross-language source of truth)."""
+
+    def _stub_run(self, returncode=0, stdout='{}'):
+        return SimpleNamespace(returncode=returncode, stdout=stdout)
+
+    def test_uses_cli_output_when_cli_is_available(self):
+        # resolveCli returns a path → CLI invoked → JSON parsed →
+        # returned as the canonical tuple. Python parsers MUST
+        # NOT fire.
+        canned = '{"entries":[{"id":"library::Foo","name":"Foo",' \
+                 '"version":"1.0","direct":true,"type":"library",' \
+                 '"group":"","parents":[]}],' \
+                 '"scope_label":"all","truncated":false}'
+        with mock.patch.object(agent, 'resolveCli',
+                                  return_value='/path/to/bugsee-cli'), \
+                mock.patch.object(agent, '_resolve_product_binary_path',
+                                  return_value=None), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout=canned)) as run_mock:
+            entries, scope, truncated = agent._collect_all_dependencies(
+                '/some/dir',
+            )
+        # The CLI subcommand's entries win — no Python parsing.
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['name'], 'Foo')
+        self.assertEqual(scope, 'all')
+        self.assertFalse(truncated)
+        # subprocess.run called once with the correct argv shape.
+        run_mock.assert_called_once()
+        argv = run_mock.call_args[0][0]
+        self.assertEqual(argv[0], '/path/to/bugsee-cli')
+        self.assertIn('ios-deps', argv)
+        self.assertIn('collect', argv)
+        pr_idx = argv.index('--project-root')
+        self.assertEqual(argv[pr_idx + 1], '/some/dir')
+
+    def test_forwards_product_binary_when_present(self):
+        # When a product binary is resolved, the CLI invocation
+        # MUST forward it via --product-binary so the vendored-
+        # framework scan happens Rust-side.
+        canned = '{"entries":[],"scope_label":"all","truncated":false}'
+        with mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent, '_resolve_product_binary_path',
+                                  return_value='/path/to/MyApp'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout=canned)) as run_mock:
+            agent._collect_all_dependencies('/some/dir')
+        argv = run_mock.call_args[0][0]
+        pb_idx = argv.index('--product-binary')
+        self.assertEqual(argv[pb_idx + 1], '/path/to/MyApp')
+
+    def test_omits_product_binary_when_not_resolved(self):
+        # No product binary → no flag. The CLI's signature is
+        # `--product-binary` optional; passing nothing is the
+        # correct shape.
+        canned = '{"entries":[],"scope_label":"all","truncated":false}'
+        with mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent, '_resolve_product_binary_path',
+                                  return_value=None), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout=canned)) as run_mock:
+            agent._collect_all_dependencies('/some/dir')
+        argv = run_mock.call_args[0][0]
+        self.assertNotIn('--product-binary', argv)
+
+    def test_falls_back_to_python_when_cli_unavailable(self):
+        # resolveCli returns None → Python parsers run. Verify by
+        # supplying a real Podfile.lock and asserting the Python
+        # parser's specific output (1 entry, version 0.7.1).
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value=None), \
+                mock.patch.object(agent, '_resolve_product_binary_path',
+                                  return_value=None), \
+                mock.patch.object(agent.subprocess, 'run') as run_mock:
+            podfile = os.path.join(root, 'Podfile.lock')
+            with open(podfile, 'w') as f:
+                f.write("PODS:\n  - SocketRocket (0.7.1)\n\n"
+                        "DEPENDENCIES:\n  - SocketRocket\n\n"
+                        "SPEC CHECKSUMS:\n  SocketRocket: feedface\n")
+            entries, scope, truncated = agent._collect_all_dependencies(root)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]['name'], 'SocketRocket')
+        self.assertEqual(entries[0]['version'], '0.7.1')
+        # subprocess.run NEVER called (no CLI to shell to).
+        self.assertEqual(run_mock.call_count, 0)
+
+    def test_falls_back_to_python_on_cli_nonzero_exit(self):
+        # CLI exits non-zero (older bugsee-cli without the
+        # subcommand → exit 2). Fall through to Python parsers.
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent, '_resolve_product_binary_path',
+                                  return_value=None), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=2, stdout='')):
+            # Same fixture as above so the assertion can pin the
+            # Python parser's output, NOT a CLI canned response.
+            podfile = os.path.join(root, 'Podfile.lock')
+            with open(podfile, 'w') as f:
+                f.write("PODS:\n  - SocketRocket (0.7.1)\n\n"
+                        "DEPENDENCIES:\n  - SocketRocket\n\n"
+                        "SPEC CHECKSUMS:\n  SocketRocket: feedface\n")
+            entries, _, _ = agent._collect_all_dependencies(root)
+        self.assertEqual(entries[0]['name'], 'SocketRocket')
+
+    def test_falls_back_to_python_on_malformed_cli_json(self):
+        # CLI emits garbage / partial stream → ValueError → fall
+        # back to Python.
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent, '_resolve_product_binary_path',
+                                  return_value=None), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout='not json')):
+            podfile = os.path.join(root, 'Podfile.lock')
+            with open(podfile, 'w') as f:
+                f.write("PODS:\n  - SocketRocket (0.7.1)\n\n"
+                        "DEPENDENCIES:\n  - SocketRocket\n\n"
+                        "SPEC CHECKSUMS:\n  SocketRocket: feedface\n")
+            entries, _, _ = agent._collect_all_dependencies(root)
+        self.assertEqual(entries[0]['name'], 'SocketRocket')
+
+    def test_falls_back_to_python_on_oserror(self):
+        # ENOEXEC / FileNotFoundError on a stale CLI path → OSError
+        # → fall back to Python. Same posture as the dSYM upload
+        # path and the VCS metadata fallback.
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent, '_resolve_product_binary_path',
+                                  return_value=None), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  side_effect=OSError("ENOEXEC")):
+            podfile = os.path.join(root, 'Podfile.lock')
+            with open(podfile, 'w') as f:
+                f.write("PODS:\n  - SocketRocket (0.7.1)\n\n"
+                        "DEPENDENCIES:\n  - SocketRocket\n\n"
+                        "SPEC CHECKSUMS:\n  SocketRocket: feedface\n")
+            entries, _, _ = agent._collect_all_dependencies(root)
+        self.assertEqual(entries[0]['name'], 'SocketRocket')
+
+
 class TestEnvTruthy(unittest.TestCase):
     def test_canonical_on_tokens_are_truthy(self):
         # These five forms must all map to True — they're the same
