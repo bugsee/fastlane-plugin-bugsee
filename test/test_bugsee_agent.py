@@ -28,6 +28,7 @@ import importlib.util
 import importlib.machinery
 import json
 import os
+import subprocess
 import tempfile
 import textwrap
 import unittest
@@ -986,8 +987,29 @@ class TestCollectBuildMetadata(unittest.TestCase):
     def setUp(self):
         self._prev = _install_options(agent, build_dir=None,
                                        version=None, build=None)
+        # The shape-of-body tests focus on Info.plist + env fallback
+        # plumbing. The xcode-version and VCS resolvers have their
+        # own test classes below; here we silence them so:
+        #   1. `resolve_xcode_version` doesn't shell out to
+        #      `xcodebuild -version` on every test (~50 ms each →
+        #      otherwise the suite goes from 40 ms to 350 ms).
+        #   2. `resolve_vcs_metadata` doesn't pick up the host
+        #      machine's git context (the tests run from inside a
+        #      real git repo; without this stub the body['vcs']
+        #      field would carry the CI machine's commit_sha and
+        #      the tests would be host-dependent).
+        self._patches = [
+            mock.patch.object(agent, 'resolve_xcode_version',
+                              return_value=None),
+            mock.patch.object(agent, 'resolve_vcs_metadata',
+                              return_value={}),
+        ]
+        for p in self._patches:
+            p.start()
 
     def tearDown(self):
+        for p in self._patches:
+            p.stop()
         _restore_options(agent, self._prev)
 
     def _make_plist(self, body):
@@ -1151,6 +1173,507 @@ class TestCollectAllDependencies(unittest.TestCase):
             merged, _scope, _truncated = agent._collect_all_dependencies(root)
         names = {e['name'] for e in merged}
         self.assertIn('swift-collections', names)
+
+
+# ──────────────────────────────────────────────
+# Build-environment helpers (ported from SDK BugseeAgent)
+# ──────────────────────────────────────────────
+#
+# `resolve_machine_label` / `resolve_vcs_metadata` /
+# `resolve_xcode_version` (plus the trio of pure helpers
+# `_env_truthy` / `_set_if_present` / `_local_hostname`) port the
+# CI-provider-aware build context from the SDK's tools.bundle
+# agent. The wire shape is consumed verbatim by the appserver's
+# `sanitizeVcs` / `sanitizeBuildMetadata` and the dashboard reads
+# `vcs.branch` / `vcs.commit_sha` / `vcs.pr_number` directly, so
+# every emitted field is part of a cross-platform contract.
+
+
+class TestEnvTruthy(unittest.TestCase):
+    def test_canonical_on_tokens_are_truthy(self):
+        # These five forms must all map to True — they're the same
+        # set the Android Gradle plugin honours, so one CI config
+        # snippet can enable a feature on both platforms.
+        for tok in ('1', 'true', 'yes', 'on',
+                    'TRUE', 'YES', '  on  '):
+            self.assertTrue(agent._env_truthy(tok),
+                            "expected truthy: %r" % tok)
+
+    def test_falsy_or_empty_is_false(self):
+        for tok in (None, '', '   ', '0', 'false', 'no', 'off',
+                    'maybe', 'enabled'):
+            self.assertFalse(agent._env_truthy(tok),
+                             "expected falsy: %r" % tok)
+
+
+class TestSetIfPresent(unittest.TestCase):
+    def test_writes_non_empty_string(self):
+        out = {}
+        agent._set_if_present(out, 'key', 'value')
+        self.assertEqual(out, {'key': 'value'})
+
+    def test_strips_whitespace(self):
+        # The dashboard distinguishes "missing" from "known empty"
+        # by field presence — but a key with whitespace surrounding
+        # the value is just bad hygiene, so strip.
+        out = {}
+        agent._set_if_present(out, 'key', '  value  ')
+        self.assertEqual(out, {'key': 'value'})
+
+    def test_skips_none(self):
+        out = {}
+        agent._set_if_present(out, 'key', None)
+        self.assertEqual(out, {})
+
+    def test_skips_empty_string(self):
+        # Critical: missing-vs-empty is the dashboard's signal for
+        # "unknown vs known-empty". Empty MUST NOT write.
+        out = {}
+        agent._set_if_present(out, 'key', '')
+        self.assertEqual(out, {})
+
+    def test_skips_whitespace_only_string(self):
+        # Same gate as empty — a CI env that exports `BRANCH=" "`
+        # has nothing useful.
+        out = {}
+        agent._set_if_present(out, 'key', '   ')
+        self.assertEqual(out, {})
+
+    def test_stringifies_non_string_value(self):
+        # CI envs occasionally surface numeric values via boolean
+        # default substitution; the helper coerces to str.
+        out = {}
+        agent._set_if_present(out, 'key', 42)
+        self.assertEqual(out, {'key': '42'})
+
+
+class TestLocalHostname(unittest.TestCase):
+    def test_returns_socket_hostname(self):
+        with mock.patch('socket.gethostname',
+                        return_value='dev-laptop.local'):
+            self.assertEqual(agent._local_hostname(),
+                             'dev-laptop.local')
+
+    def test_returns_none_when_socket_raises(self):
+        # Sandboxed runners may block hostname lookup; return None
+        # so the caller can fall through cleanly.
+        with mock.patch('socket.gethostname',
+                        side_effect=OSError("sandboxed")):
+            self.assertIsNone(agent._local_hostname())
+
+    def test_returns_none_when_socket_returns_empty(self):
+        # Defensive — empty hostname is treated as absent.
+        with mock.patch('socket.gethostname', return_value=''):
+            self.assertIsNone(agent._local_hostname())
+
+
+class TestResolveMachineLabel(unittest.TestCase):
+    def test_github_actions_with_runner_name(self):
+        # Provider precedence is highest signal first; GITHUB_ACTIONS
+        # must NOT lose to a generic CI=true falling through.
+        with mock.patch.dict(os.environ, {
+            'GITHUB_ACTIONS': 'true',
+            'RUNNER_NAME':    'gh-runner-7',
+            'CI':             'true',  # generic — must be shadowed
+        }, clear=True):
+            self.assertEqual(agent.resolve_machine_label(),
+                             'github-actions:gh-runner-7')
+
+    def test_github_actions_without_runner_name(self):
+        with mock.patch.dict(os.environ, {
+            'GITHUB_ACTIONS': 'true',
+        }, clear=True):
+            self.assertEqual(agent.resolve_machine_label(),
+                             'github-actions')
+
+    def test_gitlab_ci_prefers_runner_description(self):
+        # Description is human-readable, ID is a numeric global —
+        # description wins when both are set.
+        with mock.patch.dict(os.environ, {
+            'GITLAB_CI':              'true',
+            'CI_RUNNER_DESCRIPTION':  'macos-arm64-pool',
+            'CI_RUNNER_ID':           '12345',
+        }, clear=True):
+            self.assertEqual(agent.resolve_machine_label(),
+                             'gitlab-ci:macos-arm64-pool')
+
+    def test_gitlab_ci_falls_back_to_runner_id(self):
+        with mock.patch.dict(os.environ, {
+            'GITLAB_CI':    'true',
+            'CI_RUNNER_ID': '12345',
+        }, clear=True):
+            self.assertEqual(agent.resolve_machine_label(),
+                             'gitlab-ci:12345')
+
+    def test_jenkins_uses_node_name(self):
+        with mock.patch.dict(os.environ, {
+            'JENKINS_URL': 'https://jenkins.example.com',
+            'NODE_NAME':   'mac-build-agent',
+        }, clear=True):
+            self.assertEqual(agent.resolve_machine_label(),
+                             'jenkins:mac-build-agent')
+
+    def test_circleci_uses_node_index(self):
+        with mock.patch.dict(os.environ, {
+            'CIRCLECI':           'true',
+            'CIRCLE_NODE_INDEX':  '0',
+        }, clear=True):
+            self.assertEqual(agent.resolve_machine_label(),
+                             'circleci:0')
+
+    def test_bitrise_uses_app_slug(self):
+        with mock.patch.dict(os.environ, {
+            'BITRISE_IO':       'true',
+            'BITRISE_APP_SLUG': 'abc123def456',
+        }, clear=True):
+            self.assertEqual(agent.resolve_machine_label(),
+                             'bitrise:abc123def456')
+
+    def test_xcode_cloud_uses_workflow_name(self):
+        # `CI_WORKFLOW` is Apple's canonical presence signal for
+        # Xcode Cloud — must surface ahead of the generic CI=true
+        # fall-through.
+        with mock.patch.dict(os.environ, {
+            'CI_WORKFLOW': 'Release Archive',
+            'CI':          'true',  # set on every Xcode Cloud run
+        }, clear=True):
+            self.assertEqual(agent.resolve_machine_label(),
+                             'xcode-cloud:Release Archive')
+
+    def test_generic_ci_uses_hostname(self):
+        # Last-resort CI provider — no specific marker, fall back
+        # to the runner's hostname.
+        with mock.patch.dict(os.environ, {
+            'CI':       'true',
+            'HOSTNAME': 'ci-runner-42',
+        }, clear=True):
+            self.assertEqual(agent.resolve_machine_label(),
+                             'ci:ci-runner-42')
+
+    def test_no_provider_returns_local_hostname(self):
+        # No CI env vars at all → label is just the bare hostname
+        # via _local_hostname.
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch('socket.gethostname',
+                           return_value='dev-laptop.local'):
+            self.assertEqual(agent.resolve_machine_label(),
+                             'dev-laptop.local')
+
+
+class TestResolveVcsMetadata(unittest.TestCase):
+    def test_github_actions_push(self):
+        # Push event: GITHUB_REF carries `refs/heads/<branch>` and
+        # the resolver must strip the prefix. No PR number on push.
+        with mock.patch.dict(os.environ, {
+            'GITHUB_ACTIONS':     'true',
+            'GITHUB_SHA':         'abc123def456',
+            'GITHUB_REPOSITORY':  'bugsee/fastlane-plugin-bugsee',
+            'GITHUB_REF':         'refs/heads/master',
+            'GITHUB_EVENT_NAME':  'push',
+        }, clear=True):
+            vcs = agent.resolve_vcs_metadata('/no/working/dir')
+        self.assertEqual(vcs['provider'],   'github')
+        self.assertEqual(vcs['commit_sha'], 'abc123def456')
+        self.assertEqual(vcs['repo'],       'bugsee/fastlane-plugin-bugsee')
+        self.assertEqual(vcs['branch'],     'master')
+        # Push events MUST NOT carry pr_number — the dashboard
+        # treats its presence as "this build is a PR build".
+        self.assertNotIn('pr_number', vcs)
+        self.assertNotIn('base_branch', vcs)
+
+    def test_github_actions_pull_request(self):
+        # PR event: GITHUB_HEAD_REF / GITHUB_BASE_REF carry the
+        # source / target branches; PR number is dug out of the
+        # GITHUB_REF regex `refs/pull/<n>/merge`.
+        with mock.patch.dict(os.environ, {
+            'GITHUB_ACTIONS':     'true',
+            'GITHUB_SHA':         'pr-sha',
+            'GITHUB_REPOSITORY':  'org/repo',
+            'GITHUB_HEAD_REF':    'feature/x',
+            'GITHUB_BASE_REF':    'main',
+            'GITHUB_REF':         'refs/pull/42/merge',
+            'GITHUB_EVENT_NAME':  'pull_request',
+        }, clear=True):
+            vcs = agent.resolve_vcs_metadata('/no/working/dir')
+        self.assertEqual(vcs['provider'],    'github')
+        self.assertEqual(vcs['commit_sha'],  'pr-sha')
+        self.assertEqual(vcs['branch'],      'feature/x')
+        self.assertEqual(vcs['base_branch'], 'main')
+        # pr_number is int (NOT str) — the dashboard's mongo query
+        # filters by numeric type, a string '42' would be invisible.
+        self.assertEqual(vcs['pr_number'], 42)
+        self.assertIsInstance(vcs['pr_number'], int)
+
+    def test_gitlab_merge_request(self):
+        with mock.patch.dict(os.environ, {
+            'GITLAB_CI':                              'true',
+            'CI_COMMIT_SHA':                          'gl-sha',
+            'CI_PROJECT_PATH':                        'group/project',
+            'CI_MERGE_REQUEST_IID':                   '7',
+            'CI_MERGE_REQUEST_SOURCE_BRANCH_NAME':    'feat/foo',
+            'CI_MERGE_REQUEST_TARGET_BRANCH_NAME':    'develop',
+        }, clear=True):
+            vcs = agent.resolve_vcs_metadata('/no/working/dir')
+        self.assertEqual(vcs['provider'],    'gitlab')
+        self.assertEqual(vcs['commit_sha'],  'gl-sha')
+        self.assertEqual(vcs['repo'],        'group/project')
+        self.assertEqual(vcs['branch'],      'feat/foo')
+        self.assertEqual(vcs['base_branch'], 'develop')
+        # IID (not ID) — the ID is a global DB key, useless as a
+        # PR reference. Pin the source for the value.
+        self.assertEqual(vcs['pr_number'], 7)
+
+    def test_gitlab_push_event(self):
+        # Push pipelines lack CI_MERGE_REQUEST_IID — branch comes
+        # from CI_COMMIT_REF_NAME instead.
+        with mock.patch.dict(os.environ, {
+            'GITLAB_CI':              'true',
+            'CI_COMMIT_SHA':          'gl-push-sha',
+            'CI_COMMIT_REF_NAME':     'master',
+        }, clear=True):
+            vcs = agent.resolve_vcs_metadata('/no/working/dir')
+        self.assertEqual(vcs['branch'], 'master')
+        self.assertNotIn('pr_number', vcs)
+        self.assertNotIn('base_branch', vcs)
+
+    def test_bitbucket_pr(self):
+        with mock.patch.dict(os.environ, {
+            'BITBUCKET_BUILD_NUMBER':       '42',
+            'BITBUCKET_COMMIT':             'bb-sha',
+            'BITBUCKET_REPO_FULL_NAME':     'team/repo',
+            'BITBUCKET_BRANCH':             'feature/x',
+            'BITBUCKET_PR_ID':              '99',
+            'BITBUCKET_PR_DESTINATION_BRANCH': 'master',
+        }, clear=True):
+            vcs = agent.resolve_vcs_metadata('/no/working/dir')
+        self.assertEqual(vcs['provider'],    'bitbucket')
+        self.assertEqual(vcs['commit_sha'],  'bb-sha')
+        self.assertEqual(vcs['repo'],        'team/repo')
+        self.assertEqual(vcs['branch'],      'feature/x')
+        self.assertEqual(vcs['base_branch'], 'master')
+        self.assertEqual(vcs['pr_number'],   99)
+
+    def test_git_fallback_local_dev(self):
+        # No CI provider env → shell out to `git` in working_dir.
+        # Use a real temp git repo so the test isn't dependent on
+        # the host machine's git state.
+        with tempfile.TemporaryDirectory() as repo:
+            subprocess.run(['git', 'init', '-q', '-b', 'main', repo],
+                           check=True)
+            subprocess.run(['git', 'config', 'user.email',
+                            'test@example.com'],
+                           cwd=repo, check=True)
+            subprocess.run(['git', 'config', 'user.name', 'Test'],
+                           cwd=repo, check=True)
+            open(os.path.join(repo, 'file.txt'), 'w').write('hi')
+            subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+            subprocess.run(['git', 'commit', '-q', '-m', 'init'],
+                           cwd=repo, check=True)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                vcs = agent.resolve_vcs_metadata(repo)
+        # Local commit_sha + branch must surface; provider is
+        # absent (no CI matched) — the server tolerates a partial
+        # vcs sub-object.
+        self.assertIn('commit_sha', vcs)
+        self.assertEqual(len(vcs['commit_sha']), 40)  # full SHA-1
+        self.assertEqual(vcs['branch'], 'main')
+        self.assertNotIn('provider', vcs)
+
+    def test_git_fallback_returns_empty_for_nonexistent_dir(self):
+        # No CI env AND no working dir → empty dict. The caller
+        # (`_collect_build_metadata`) skips emitting `vcs` when
+        # this returns empty.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                agent.resolve_vcs_metadata('/no/such/dir'), {})
+
+    def test_git_fallback_returns_empty_for_non_git_dir(self):
+        with tempfile.TemporaryDirectory() as plain_dir, \
+                mock.patch.dict(os.environ, {}, clear=True):
+            # No .git → `git rev-parse HEAD` errors → empty dict.
+            self.assertEqual(
+                agent.resolve_vcs_metadata(plain_dir), {})
+
+
+class TestResolveXcodeVersion(unittest.TestCase):
+    def test_decodes_numeric_env_var_to_dotted_form(self):
+        # Xcode exports `XCODE_VERSION_ACTUAL=1620` for Xcode 16.2.0;
+        # the resolver must split that into 16.2.0 without shelling
+        # out (the dashboard displays the dotted form).
+        with mock.patch.dict(os.environ,
+                             {'XCODE_VERSION_ACTUAL': '1620'},
+                             clear=True):
+            self.assertEqual(agent.resolve_xcode_version(), '16.2.0')
+
+    def test_decodes_three_digit_patch_version(self):
+        # `1543` → 15.4.3 — pins the three-component split rule
+        # (last digit = patch, second-to-last = minor, prefix =
+        # major). A naive `[0:2], [2:4]` split would yield 15.43.
+        with mock.patch.dict(os.environ,
+                             {'XCODE_VERSION_ACTUAL': '1543'},
+                             clear=True):
+            self.assertEqual(agent.resolve_xcode_version(), '15.4.3')
+
+    def test_falls_back_to_xcodebuild_when_env_var_absent(self):
+        # Env var unset → resolver shells out to xcodebuild. Mock
+        # subprocess to a canonical "Xcode 16.0\nBuild version 16A242d"
+        # response and pin the parsed major.minor form.
+        canned = SimpleNamespace(
+            returncode=0,
+            stdout="Xcode 16.0\nBuild version 16A242d\n",
+        )
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch('subprocess.run', return_value=canned):
+            self.assertEqual(agent.resolve_xcode_version(), '16.0')
+
+    def test_returns_none_when_xcodebuild_fails(self):
+        # `xcodebuild -version` nonzero exit → resolver returns
+        # None so the caller can omit the field rather than
+        # surfacing a garbled value.
+        canned = SimpleNamespace(returncode=1, stdout='', stderr='nope')
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch('subprocess.run', return_value=canned):
+            self.assertIsNone(agent.resolve_xcode_version())
+
+    def test_returns_none_when_xcodebuild_missing(self):
+        # FileNotFoundError on stripped-down CI images without
+        # Xcode installed.
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch('subprocess.run',
+                           side_effect=FileNotFoundError("xcodebuild")):
+            self.assertIsNone(agent.resolve_xcode_version())
+
+    def test_non_numeric_env_var_falls_through(self):
+        # Defensive: if Xcode ever exports a dotted form directly
+        # (`16.2.0`), the `.isdigit()` guard must short-circuit
+        # the numeric reformat and fall through to xcodebuild.
+        canned = SimpleNamespace(
+            returncode=0, stdout="Xcode 16.2.0\n",
+        )
+        with mock.patch.dict(os.environ,
+                             {'XCODE_VERSION_ACTUAL': '16.2.0'},
+                             clear=True), \
+                mock.patch('subprocess.run', return_value=canned):
+            self.assertEqual(agent.resolve_xcode_version(), '16.2.0')
+
+
+# ──────────────────────────────────────────────
+# _collect_build_metadata — vcs sub-object wiring
+# ──────────────────────────────────────────────
+
+class TestCollectBuildMetadataVcsWiring(unittest.TestCase):
+    """Pins the wiring between resolve_vcs_metadata and the body
+    dict. The exhaustive provider matrix is tested in
+    TestResolveVcsMetadata; this class only verifies the bridge
+    between the resolver's output and the build registration POST."""
+
+    def setUp(self):
+        self._prev = _install_options(agent, build_dir=None,
+                                       version=None, build=None)
+
+    def tearDown(self):
+        _restore_options(agent, self._prev)
+
+    def test_vcs_present_when_resolver_returns_non_empty(self):
+        # When the resolver returns content, body['vcs'] surfaces
+        # verbatim — sibling to build_metadata, not nested under
+        # it (matches the appserver's sanitizeVcs expectation).
+        canned = {'provider': 'github', 'commit_sha': 'abc',
+                  'branch': 'main'}
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(agent, 'resolve_vcs_metadata',
+                                  return_value=canned), \
+                mock.patch.object(agent, 'resolve_xcode_version',
+                                  return_value=None):
+            body = agent._collect_build_metadata()
+        self.assertEqual(body['vcs'], canned)
+        # Pin position: NOT inside build_metadata.
+        self.assertNotIn('vcs', body['build_metadata'])
+
+    def test_vcs_omitted_when_resolver_returns_empty(self):
+        # Empty dict signals "no CI provider AND no git in
+        # working_dir" — better to omit the field than carry an
+        # empty {} that pollutes the dashboard.
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(agent, 'resolve_vcs_metadata',
+                                  return_value={}), \
+                mock.patch.object(agent, 'resolve_xcode_version',
+                                  return_value=None):
+            body = agent._collect_build_metadata()
+        self.assertNotIn('vcs', body)
+
+    def test_resolver_called_with_srcroot_first(self):
+        # Precedence chain: SRCROOT > PROJECT_DIR > cwd. Pin the
+        # top of the chain — a future swap to PROJECT_DIR-first
+        # would silently route the git fallback at the wrong
+        # working dir in mixed Xcode + manual-CLI invocations.
+        with mock.patch.dict(os.environ, {
+            'SRCROOT':     '/path/to/srcroot',
+            'PROJECT_DIR': '/path/to/projectdir',
+        }, clear=True), \
+                mock.patch.object(agent, 'resolve_vcs_metadata',
+                                  return_value={}) as vcs_mock, \
+                mock.patch.object(agent, 'resolve_xcode_version',
+                                  return_value=None):
+            agent._collect_build_metadata()
+        vcs_mock.assert_called_once_with('/path/to/srcroot')
+
+    def test_resolver_falls_back_to_project_dir_when_srcroot_absent(self):
+        with mock.patch.dict(os.environ, {
+            'PROJECT_DIR': '/path/to/projectdir',
+        }, clear=True), \
+                mock.patch.object(agent, 'resolve_vcs_metadata',
+                                  return_value={}) as vcs_mock, \
+                mock.patch.object(agent, 'resolve_xcode_version',
+                                  return_value=None):
+            agent._collect_build_metadata()
+        vcs_mock.assert_called_once_with('/path/to/projectdir')
+
+    def test_machine_host_uses_machine_label_resolver(self):
+        # `body['build_metadata']['machine']['host']` must come
+        # from resolve_machine_label, NOT platform.node() — the
+        # CI-provider-aware label is what the dashboard clusters
+        # by.
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(agent, 'resolve_machine_label',
+                                  return_value='github-actions:gh-runner'), \
+                mock.patch.object(agent, 'resolve_vcs_metadata',
+                                  return_value={}), \
+                mock.patch.object(agent, 'resolve_xcode_version',
+                                  return_value=None):
+            body = agent._collect_build_metadata()
+        self.assertEqual(body['build_metadata']['machine']['host'],
+                         'github-actions:gh-runner')
+
+    def test_machine_host_falls_back_to_platform_node(self):
+        # When the label resolver returns None (no CI, no
+        # hostname), fall back to platform.node() so the field is
+        # never null in the upload.
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(agent, 'resolve_machine_label',
+                                  return_value=None), \
+                mock.patch('platform.node',
+                           return_value='fallback-host'), \
+                mock.patch.object(agent, 'resolve_vcs_metadata',
+                                  return_value={}), \
+                mock.patch.object(agent, 'resolve_xcode_version',
+                                  return_value=None):
+            body = agent._collect_build_metadata()
+        self.assertEqual(body['build_metadata']['machine']['host'],
+                         'fallback-host')
+
+    def test_build_system_version_uses_xcode_version_resolver(self):
+        # `build_system.version` comes from resolve_xcode_version,
+        # NOT the raw XCODE_VERSION_ACTUAL env var (which is in
+        # the un-dotted numeric form).
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(agent, 'resolve_xcode_version',
+                                  return_value='16.2.0'), \
+                mock.patch.object(agent, 'resolve_vcs_metadata',
+                                  return_value={}):
+            body = agent._collect_build_metadata()
+        self.assertEqual(body['build_metadata']['build_system']['version'],
+                         '16.2.0')
 
 
 if __name__ == '__main__':

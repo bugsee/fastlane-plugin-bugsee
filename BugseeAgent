@@ -29,6 +29,7 @@ import hashlib
 import shutil
 import gzip
 import plistlib
+import socket
 import time
 import platform
 from optparse import OptionParser
@@ -702,6 +703,236 @@ def _gzip_json_bytes(obj):
 
 
 # ──────────────────────────────────────────────────────────────────
+# Build environment metadata (machine label, VCS, Xcode version)
+#
+# Ported from the SDK's tools.bundle/BugseeAgent. The wire shape
+# matches the Android Gradle plugin's `BuildMachineResolver` and
+# `VcsMetadataResolver` so a single build record can compare iOS
+# and Android runs from the same CI runner.
+#
+# The appserver's `sanitizeVcs` / `sanitizeBuildMetadata`
+# (appserver/code/components/app/builds/modules/build.vcs-helper.js)
+# accepts these fields verbatim; the dashboard's build view reads
+# `vcs.branch` / `vcs.commit_sha` / `vcs.pr_number` directly.
+# ──────────────────────────────────────────────────────────────────
+
+def _env_truthy(value):
+    """True when an env-var-style value is a conventional "on" token.
+    Matches the set used by the Android Gradle plugin (`"1"`, `"true"`,
+    `"yes"`, `"on"`, case-insensitive) so one CI config snippet
+    can enable a feature on both platforms."""
+    return (value or '').strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _set_if_present(out, key, value):
+    """Only write `key` to `out` when `value` is a non-empty string.
+    Keeps the JSON payload clean — the back-end distinguishes
+    "unknown" from "known empty" by field presence."""
+    if value and str(value).strip():
+        out[key] = str(value).strip()
+
+
+def _local_hostname():
+    """Short hostname or None. `socket.gethostname()` is the standard
+    cross-platform lookup; it may throw on sandboxed hosts, hence
+    the broad except."""
+    try:
+        host = socket.gethostname()
+        return host if host else None
+    except Exception:
+        return None
+
+
+def resolve_machine_label():
+    """Returns a `<provider>[:<detail>]` label describing where the
+    build ran — mirrors the cascade in the Android plugin's
+    `BuildMachineResolver` so the front-end can group iOS + Android
+    builds from the same CI runner. Pure env-based detection; no
+    shelling out.
+
+    First positive provider signal wins. Falls back to the local
+    hostname when nothing matches AND hostname lookup succeeds.
+    Returns None as last resort (sandboxed / networkless hosts).
+    """
+    env = os.environ
+
+    def with_detail(prefix, detail):
+        detail = (detail or '').strip()
+        return '%s:%s' % (prefix, detail) if detail else prefix
+
+    if _env_truthy(env.get('GITHUB_ACTIONS')):
+        return with_detail('github-actions', env.get('RUNNER_NAME'))
+    if _env_truthy(env.get('GITLAB_CI')):
+        detail = ((env.get('CI_RUNNER_DESCRIPTION') or '').strip()
+                  or (env.get('CI_RUNNER_ID') or '').strip())
+        return with_detail('gitlab-ci', detail)
+    if (env.get('JENKINS_URL') or '').strip():
+        return with_detail('jenkins', env.get('NODE_NAME'))
+    if _env_truthy(env.get('CIRCLECI')):
+        return with_detail('circleci', env.get('CIRCLE_NODE_INDEX'))
+    if _env_truthy(env.get('BITRISE_IO')):
+        return with_detail('bitrise', env.get('BITRISE_APP_SLUG'))
+    if (env.get('TEAMCITY_VERSION') or '').strip():
+        agent_name = ((env.get('AGENT_NAME') or '').strip()
+                      or (env.get('agent.name') or '').strip())
+        return with_detail('teamcity', agent_name)
+    # Xcode Cloud — Apple's own CI. `CI_WORKFLOW` is the canonical
+    # presence signal; `CI_XCODEBUILD_ACTION` adds action context
+    # (build / archive / test) when available.
+    if ((env.get('CI_WORKFLOW') or '').strip()
+            or _env_truthy(env.get('CI_XCODE_CLOUD'))):
+        detail = ((env.get('CI_WORKFLOW') or '').strip()
+                  or (env.get('CI_XCODEBUILD_ACTION') or '').strip())
+        return with_detail('xcode-cloud', detail)
+    if _env_truthy(env.get('CI')):
+        host = ((env.get('HOSTNAME') or '').strip()
+                or _local_hostname() or '')
+        return with_detail('ci', host)
+
+    return _local_hostname()
+
+
+def _run_git(working_dir, git_args):
+    try:
+        result = subprocess.run(
+            ['/usr/bin/env', 'git'] + list(git_args),
+            cwd=working_dir,
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        return (result.stdout or '').strip() or None
+    except Exception:
+        return None
+
+
+def _resolve_git_fallback(working_dir):
+    """Shell out to `git` for the basics. Returns {} if not a git
+    working tree, or if `git` isn't on PATH (rare on dev macs, but
+    possible in stripped-down CI containers)."""
+    if not working_dir or not os.path.isdir(working_dir):
+        return {}
+    out = {}
+    commit = _run_git(working_dir, ['rev-parse', 'HEAD'])
+    if commit:
+        out['commit_sha'] = commit
+    branch = _run_git(working_dir, ['rev-parse', '--abbrev-ref', 'HEAD'])
+    # Detached HEADs show up as "HEAD" — not a meaningful branch name.
+    if branch and branch != 'HEAD':
+        out['branch'] = branch
+    return out
+
+
+def resolve_vcs_metadata(working_dir):
+    """Returns a dict shaped for the upload JSON's nested `vcs`
+    sub-object. Matches what the Android Gradle plugin emits so the
+    back-end persists both identically. Keys (any / all may be
+    absent):
+
+        commit_sha, base_sha, branch, base_branch, pr_number,
+        provider, repo
+
+    Resolution order — first provider with a positive signal wins:
+      1. GitHub Actions env (push + pull_request events).
+      2. GitLab CI env (push + merge_request events).
+      3. Bitbucket Pipelines env.
+      4. Git fallback — shell out to `git` in `working_dir` when
+         none of the CI providers matched. Lets local dev archives
+         still carry `commit_sha` / `branch` without needing CI
+         context.
+    """
+    env = os.environ
+
+    # GitHub Actions ----------------------------------------------
+    if _env_truthy(env.get('GITHUB_ACTIONS')):
+        out = {'provider': 'github'}
+        _set_if_present(out, 'commit_sha', env.get('GITHUB_SHA'))
+        _set_if_present(out, 'repo',       env.get('GITHUB_REPOSITORY'))
+        if (env.get('GITHUB_EVENT_NAME') or '') == 'pull_request':
+            _set_if_present(out, 'branch',      env.get('GITHUB_HEAD_REF'))
+            _set_if_present(out, 'base_branch', env.get('GITHUB_BASE_REF'))
+            m = re.search(r'refs/pull/(\d+)/', env.get('GITHUB_REF') or '')
+            if m:
+                out['pr_number'] = int(m.group(1))
+        else:
+            branch = (env.get('GITHUB_REF') or '').replace('refs/heads/', '', 1)
+            _set_if_present(out, 'branch', branch)
+        return out
+
+    # GitLab CI ---------------------------------------------------
+    if _env_truthy(env.get('GITLAB_CI')):
+        out = {'provider': 'gitlab'}
+        _set_if_present(out, 'commit_sha', env.get('CI_COMMIT_SHA'))
+        _set_if_present(out, 'repo',       env.get('CI_PROJECT_PATH'))
+        # Merge-request pipelines expose different branch variables
+        # than push pipelines. `CI_MERGE_REQUEST_IID` is the MR
+        # number (the `_ID` variant is a global DB id and unusable
+        # as a PR reference).
+        if (env.get('CI_MERGE_REQUEST_IID') or '').strip():
+            _set_if_present(out, 'branch',
+                            env.get('CI_MERGE_REQUEST_SOURCE_BRANCH_NAME'))
+            _set_if_present(out, 'base_branch',
+                            env.get('CI_MERGE_REQUEST_TARGET_BRANCH_NAME'))
+            try:
+                out['pr_number'] = int(env.get('CI_MERGE_REQUEST_IID'))
+            except (TypeError, ValueError):
+                pass
+        else:
+            _set_if_present(out, 'branch', env.get('CI_COMMIT_REF_NAME'))
+        return out
+
+    # Bitbucket Pipelines -----------------------------------------
+    if (env.get('BITBUCKET_BUILD_NUMBER') or '').strip():
+        out = {'provider': 'bitbucket'}
+        _set_if_present(out, 'commit_sha', env.get('BITBUCKET_COMMIT'))
+        _set_if_present(out, 'repo',
+                        env.get('BITBUCKET_REPO_FULL_NAME')
+                        or env.get('BITBUCKET_REPO_SLUG'))
+        _set_if_present(out, 'branch',     env.get('BITBUCKET_BRANCH'))
+        if (env.get('BITBUCKET_PR_ID') or '').strip():
+            _set_if_present(out, 'base_branch',
+                            env.get('BITBUCKET_PR_DESTINATION_BRANCH'))
+            try:
+                out['pr_number'] = int(env.get('BITBUCKET_PR_ID'))
+            except (TypeError, ValueError):
+                pass
+        return out
+
+    # Git fallback ------------------------------------------------
+    # Covers local archives + any CI provider we don't specifically
+    # recognise. Missing `provider` / `repo` is fine — the server
+    # accepts partial payloads.
+    return _resolve_git_fallback(working_dir)
+
+
+def resolve_xcode_version():
+    """Returns the short Xcode version (e.g. `"16.2"`) or None. Tries
+    `$XCODE_VERSION_ACTUAL` first (set in every Run Script env —
+    numeric like `1620`, needs reformatting), then falls back to
+    `xcodebuild -version` which is slow but ground-truth."""
+    actual = os.environ.get('XCODE_VERSION_ACTUAL')
+    if actual and actual.isdigit():
+        # "1620" → "16.2.0" ; "1543" → "15.4.3"
+        parts = [actual[0:-2] or '0', actual[-2:-1] or '0',
+                 actual[-1:] or '0']
+        return '.'.join(p.lstrip('0') or '0' for p in parts)
+
+    try:
+        result = subprocess.run(
+            ['/usr/bin/xcodebuild', '-version'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        first_line = ((result.stdout or '').splitlines()[0].strip()
+                      if result.stdout else '')
+        m = re.match(r'^Xcode\s+(\S+)', first_line)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────
 # Xcode env + Info.plist helpers
 # ──────────────────────────────────────────────────────────────────
 
@@ -757,13 +988,22 @@ def _collect_build_metadata():
         "has_mapping":         False,  # no Java-style ProGuard mapping on iOS
         "build_metadata": {
             "machine": {
-                "host": platform.node(),
+                # `host` is the CI-provider-aware label (e.g.
+                # `github-actions:Linux-X64`); falls back to
+                # platform.node() for local-archive runs where no
+                # provider env var is set. The richer label lets the
+                # dashboard cluster runs by runner across platforms.
+                "host": resolve_machine_label() or platform.node(),
                 "os":   platform.platform(),
                 "arch": platform.machine(),
             },
             "build_system": {
                 "type":    "xcode",
-                "version": os.environ.get('XCODE_VERSION_ACTUAL'),
+                # `XCODE_VERSION_ACTUAL` is the numeric form Xcode
+                # exports (`"1620"` for 16.2.0); the resolver
+                # normalises to the dotted form the dashboard
+                # displays. Falls back to `xcodebuild -version`.
+                "version": resolve_xcode_version(),
             },
             "agent": {
                 "name":    "BugseeAgent",
@@ -774,6 +1014,21 @@ def _collect_build_metadata():
             },
         },
     }
+
+    # VCS metadata. Sibling field to `build_metadata` — matches the
+    # Android Gradle plugin's wire shape and the appserver's
+    # `sanitizeVcs` accept-list. Omit the field entirely when no
+    # provider was detected AND the git fallback didn't surface a
+    # commit (e.g. /tmp archive without a .git dir) — empty `vcs: {}`
+    # records would still pass `sanitizeVcs` but pollute the dashboard.
+    vcs = resolve_vcs_metadata(
+        os.environ.get('SRCROOT')
+        or os.environ.get('PROJECT_DIR')
+        or os.getcwd()
+    )
+    if vcs:
+        body["vcs"] = vcs
+
     return body
 
 

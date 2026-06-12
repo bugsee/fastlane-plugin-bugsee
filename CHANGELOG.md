@@ -53,6 +53,36 @@ Android plugin's `DependencyPayloadSerializer.MAX_ENTRIES`); when
 exceeded, the truncated flag flows through to the worker's
 diff-compatibility check.
 
+### VCS + build-machine metadata on build registration
+
+Ported from the SDK's `tools.bundle/BugseeAgent`. The build
+registration POST now carries:
+
+- `vcs` sub-object with `provider` / `commit_sha` / `branch` /
+  `base_branch` / `pr_number` / `repo`, populated from GitHub
+  Actions, GitLab CI, or Bitbucket Pipelines env vars (provider-
+  precedence in that order), with a `git` shell-out fallback for
+  local archives. Same field names the Android Gradle plugin
+  emits, so the dashboard renders iOS and Android builds with
+  identical VCS context.
+- `build_metadata.machine.host` now carries a CI-provider-aware
+  label (`github-actions:<runner-name>`,
+  `gitlab-ci:<runner-description>`, `jenkins:<node>`, `circleci:0`,
+  `bitrise:<app-slug>`, `teamcity:<agent>`, `xcode-cloud:<workflow>`,
+  generic `ci:<hostname>`) instead of just `platform.node()`. The
+  dashboard's build-runner clustering now groups iOS + Android
+  builds from the same runner.
+- `build_metadata.build_system.version` is the dotted Xcode
+  version (`16.2.0`) instead of the raw `XCODE_VERSION_ACTUAL`
+  numeric form (`1620`). Falls back to `xcodebuild -version` when
+  the env var is absent (CLI invocations outside Xcode's build
+  phase).
+
+These fields are accepted verbatim by the appserver's
+`sanitizeVcs` / `sanitizeBuildMetadata`. The wire shape is
+finalised by the Android Gradle plugin; the iOS side simply joins
+the contract.
+
 ### Fixed
 
 - `upload_symbols_to_bugsee`'s `symbol_maps:` parameter is now
