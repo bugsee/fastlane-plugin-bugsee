@@ -29,6 +29,155 @@ import hashlib
 import shutil
 from optparse import OptionParser
 import fnmatch
+import platform
+
+
+# ──────────────────────────────────────────────────────────────────
+# bugsee-cli resolver
+#
+# Symbol upload (dSYM) is handled by the bugsee-cli Rust binary —
+# the same one the Android Gradle plugin uses. This agent shells out
+# to it instead of hand-rolling zip + curl. The binary is
+# auto-downloaded from download.bugsee.com on first use, SHA-256
+# verified, and cached under ~/.bugsee/cli/<version>/<triple>/.
+# Override via --cli-path (developer-local binary) or --cli-version
+# (test a newer release). Environment fallbacks: BUGSEE_CLI_PATH,
+# BUGSEE_CLI_VERSION.
+# ──────────────────────────────────────────────────────────────────
+
+BUGSEE_CLI_DEFAULT_VERSION = "0.1.1"
+BUGSEE_CLI_DOWNLOAD_BASE = "https://download.bugsee.com/cli"
+
+
+def detectHostTriple():
+    """Map current OS+arch to a Rust target triple the CLI is published for.
+    Returns None for unsupported combinations (Linux musl, Windows ARM64, etc.).
+    """
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    is_arm64 = machine in ("arm64", "aarch64")
+    is_amd64 = machine in ("x86_64", "amd64")
+    if system == "darwin":
+        if is_arm64:
+            return "aarch64-apple-darwin"
+        if is_amd64:
+            return "x86_64-apple-darwin"
+    elif system == "linux":
+        if is_arm64:
+            return "aarch64-unknown-linux-gnu"
+        if is_amd64:
+            return "x86_64-unknown-linux-gnu"
+    elif system.startswith("win") or system == "windows":
+        if is_amd64:
+            return "x86_64-pc-windows-msvc"
+    return None
+
+
+def resolveCli(cliPath=None, cliVersion=None):
+    """Return path to a usable bugsee-cli binary, or None.
+    Precedence: explicit cliPath > BUGSEE_CLI_PATH env > auto-download.
+    Returning None is a soft failure — caller should fall back / skip.
+    """
+    explicit = cliPath or os.environ.get("BUGSEE_CLI_PATH")
+    if explicit:
+        if os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+            return explicit
+        print("Bugsee: --cli-path %s is not an executable file; trying auto-download" % explicit)
+
+    version = cliVersion or os.environ.get("BUGSEE_CLI_VERSION") or BUGSEE_CLI_DEFAULT_VERSION
+    triple = detectHostTriple()
+    if triple is None:
+        print("Bugsee: no published bugsee-cli for host %s/%s; skipping CLI upload" % (
+            platform.system(), platform.machine()))
+        return None
+
+    cache_root = os.path.expanduser(os.path.join("~/.bugsee/cli", version, triple))
+    binary_name = "bugsee-cli.exe" if "windows" in triple else "bugsee-cli"
+    cached = os.path.join(cache_root, binary_name)
+
+    if os.path.isfile(cached) and os.access(cached, os.X_OK):
+        return cached
+
+    try:
+        os.makedirs(cache_root, exist_ok=True)
+        _downloadCli(version, triple, cache_root)
+    except Exception as e:
+        print("Bugsee: failed to download bugsee-cli v%s for %s: %s" % (version, triple, e))
+        return None
+
+    if os.path.isfile(cached) and os.access(cached, os.X_OK):
+        return cached
+    return None
+
+
+def _downloadCli(version, triple, cacheDir):
+    """Fetch tarball + SHA-256 sidecar, verify, extract via system tar."""
+    is_windows = "windows" in triple
+    ext = "zip" if is_windows else "tar.xz"
+    artifact = "bugsee-cli-%s.%s" % (triple, ext)
+    url = "%s/v%s/%s" % (BUGSEE_CLI_DOWNLOAD_BASE, version, artifact)
+    sha_url = url + ".sha256"
+
+    print("Bugsee: downloading bugsee-cli v%s for %s from %s" % (version, triple, url))
+
+    # SHA-256 sidecar format: `<hex>  <filename>` or `<hex> *<filename>` or just `<hex>`.
+    with urllib.request.urlopen(sha_url) as resp:
+        expected_sha = resp.read().decode("utf-8").strip().split()[0]
+
+    tarball_path = os.path.join(cacheDir, artifact)
+    with urllib.request.urlopen(url) as resp:
+        with open(tarball_path, "wb") as f:
+            shutil.copyfileobj(resp, f)
+
+    h = hashlib.sha256()
+    with open(tarball_path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    actual_sha = h.hexdigest()
+    if expected_sha.lower() != actual_sha.lower():
+        os.unlink(tarball_path)
+        raise IOError("SHA-256 mismatch for %s: expected %s, got %s" % (
+            artifact, expected_sha, actual_sha))
+
+    # System `tar` handles tar.xz on macOS/Linux and zip on Windows 10+ (bsdtar).
+    # `--strip-components=1` peels the `bugsee-cli-<triple>/` wrapper dir.
+    result = subprocess.run(
+        ["tar", "-xf", tarball_path, "-C", cacheDir, "--strip-components=1"],
+        capture_output=True, text=True)
+    if result.returncode != 0:
+        raise IOError("tar -xf %s failed (exit %d): %s" % (
+            artifact, result.returncode, result.stderr.strip()))
+
+    os.unlink(tarball_path)
+    binary_name = "bugsee-cli.exe" if is_windows else "bugsee-cli"
+    binary_path = os.path.join(cacheDir, binary_name)
+    if not os.path.isfile(binary_path):
+        raise IOError("extraction did not produce %s in %s" % (binary_name, cacheDir))
+    os.chmod(binary_path, 0o755)
+    print("Bugsee: bugsee-cli v%s installed at %s" % (version, binary_path))
+
+
+def uploadDsymViaCli(cliBinary, dsymPath, appToken, endpoint, version, build):
+    """Exec bugsee-cli to upload one .dSYM bundle. Returns True on success."""
+    cmd = [
+        cliBinary,
+        "--endpoint", endpoint,
+        "--app-token", appToken,
+        "debug-files", "upload",
+        "--type", "dsym",
+        "--version", version or "",
+        "--build", build or "",
+        dsymPath,
+    ]
+    # Stream stderr/stdout straight through so the user sees CLI progress
+    # in the same terminal / Xcode log they'd see BugseeAgent output in.
+    try:
+        result = subprocess.run(cmd, check=False)
+        return result.returncode == 0
+    except Exception as e:
+        print("Bugsee: failed to exec bugsee-cli at %s: %s" % (cliBinary, e))
+        return False
+
 
 def isInUploadedList(images, imageList):
     for image in images:
@@ -207,12 +356,31 @@ def uploadZipFile(zipFileLocation):
     return False
 
 def main():
+    # The actual dSYM upload is performed by the bugsee-cli Rust binary,
+    # one invocation per `.dSYM` bundle. This loop's role is:
+    #   - discover .dSYM bundles under options.dsym_folder
+    #   - extract Mach-O UUIDs (via dwarfdump) to short-circuit
+    #     dSYMs whose UUIDs are already in ~/.bugseeUploadList
+    #   - apply BCSymbolMap deobfuscation in place when --maps is set
+    #   - hand each surviving .dSYM directory to the CLI
+    # The CLI itself re-extracts UUIDs internally via
+    # `symbolic-debuginfo` and POSTs `{version, build}` to
+    # /apps/<token>/symbols — the server then walks the uploaded
+    # tarball and stores `images[]` per arch slice. Dashboard
+    # outcome is one symbol record per .dSYM (finer granularity
+    # than the legacy one-record-per-build zip).
     tempDir = tempfile.mkdtemp()
     print("Processing in " + tempDir)
-    zipFileLocation = os.path.join(tempDir, 'symbols.zip')
-    dwarfs = []
+    # List of (dsym_bundle_dir, uuids_discovered) — one entry per
+    # .dSYM the CLI needs to upload.
+    dsymUploads = []
     uploadedImages = loadUploadedList()
 
+    # Track the first .dSYM zip filename (--list mode) so the legacy
+    # `-{version}-{build}.dSYM.zip` pattern can supply the version/build
+    # fallback. Used only when neither --version/--build nor Info.plist
+    # produced values.
+    firstDsymZipForFallback = None
     if options.dsym_list:
         options.dsym_folder = tempDir
         for f in args[1:]:
@@ -220,48 +388,93 @@ def main():
                 continue
             if (os.stat(f).st_size == 0):
                 continue
+            if firstDsymZipForFallback is None:
+                firstDsymZipForFallback = f
             with zipfile.ZipFile(f, 'r') as zipf:
-                zipf.extractall(tempDir) 
+                zipf.extractall(tempDir)
+
+    # Resolve version + build with the legacy fallback chain. Order:
+    #   1. --version / --build CLI flags (or BUGSEE_APP_{VERSION,BUILD} env)
+    #   2. --list mode: `-{version}-{build}.dSYM.zip` filename pattern
+    #   3. Otherwise: CFBundleShortVersionString + CFBundleVersion from
+    #      $INFOPLIST_PATH (the Xcode build-phase default — users rarely
+    #      pass -v/-b in that context).
+    # Without resolved values the bugsee-cli exec would error out, since
+    # `--version` and `--build` are required positional args on the CLI.
+    resolvedVersion = options.version
+    resolvedBuild = options.build
+    if not (resolvedVersion and resolvedBuild):
+        fallbackVersion, fallbackBuild = getVersionAndBuild(firstDsymZipForFallback or "")
+        if not resolvedVersion:
+            resolvedVersion = fallbackVersion
+        if not resolvedBuild:
+            resolvedBuild = fallbackBuild
 
     os.chdir(options.dsym_folder)
     for root, dirs, files in os.walk(options.dsym_folder):
         if not root.endswith('dSYM/Contents/Resources/DWARF'):
             continue
 
+        # The .dSYM directory is three components up from
+        # `<bundle>.dSYM/Contents/Resources/DWARF`.
+        dsymDir = os.path.dirname(os.path.dirname(os.path.dirname(root)))
         print(root)
+
+        newImagesInDsym = []
         for f in files:
-            if (os.path.islink(os.path.join(root, f))):
+            filePath = os.path.join(root, f)
+            if os.path.islink(filePath):
                 continue
-            if (os.stat(os.path.join(root, f)).st_size == 0):
+            if os.stat(filePath).st_size == 0:
                 continue
-            images = parseDSYM(os.path.join(root, f))
-            if (len(images) == 0):
+            images = parseDSYM(filePath)
+            if len(images) == 0:
                 continue
             if isInUploadedList(images, uploadedImages):
                 print("Already uploaded %s, skipping" % f)
                 continue
             if options.symbol_maps:
-                deobfuscateDSYM(os.path.join(root, f), options.symbol_maps)
-            dwarfs.append(os.path.join(root, f))
-            uploadedImages.extend(images)
+                deobfuscateDSYM(filePath, options.symbol_maps)
+            newImagesInDsym.extend(images)
 
-    if len(dwarfs) > 0:
-        with zipfile.ZipFile(zipFileLocation, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for dwarf in dwarfs:
-                zipf.write(dwarf, os.path.relpath(dwarf, options.dsym_folder), zipfile.ZIP_DEFLATED)
+        if newImagesInDsym:
+            dsymUploads.append((dsymDir, newImagesInDsym))
 
-            icon = getIcon()
-            if icon:
-                icon = uncrushIcon(icon, tempDir)
-            if icon and os.path.isfile(icon):
-                zipf.write(icon, 'icon.png', zipfile.ZIP_DEFLATED)
-
-            zipf.close()
-
-        result = uploadZipFile(zipFileLocation)
-        if result:
-            saveUploadedList(uploadedImages)
-
+    if len(dsymUploads) > 0:
+        if not (resolvedVersion and resolvedBuild):
+            # CLI requires both. Bailing here avoids burning N CLI execs
+            # only to have each fail the same way at argv parsing.
+            print("Bugsee: could not determine version/build (none of "
+                  "--version/--build, --list-mode filename pattern, or "
+                  "$INFOPLIST_PATH produced values); %d dSYM(s) not "
+                  "uploaded" % len(dsymUploads))
+        else:
+            cliBinary = resolveCli(
+                cliPath=options.cli_path,
+                cliVersion=options.cli_version)
+            if cliBinary is None:
+                # resolveCli already explained why on stderr/stdout. Skip
+                # uploads; do NOT mark UUIDs as uploaded — next run will
+                # retry once a usable binary is available.
+                print("Bugsee: no bugsee-cli available; %d dSYM(s) not uploaded" % len(dsymUploads))
+            else:
+                successCount = 0
+                for dsymDir, images in dsymUploads:
+                    ok = uploadDsymViaCli(
+                        cliBinary,
+                        dsymDir,
+                        APP_TOKEN,
+                        options.endpoint,
+                        resolvedVersion,
+                        resolvedBuild,
+                    )
+                    if ok:
+                        successCount += 1
+                        uploadedImages.extend(images)
+                if successCount > 0:
+                    saveUploadedList(uploadedImages)
+                print("Bugsee: uploaded %d/%d dSYM(s) via bugsee-cli" % (
+                    successCount, len(dsymUploads)))
 
     # cleanup
     shutil.rmtree(tempDir, ignore_errors=True)
@@ -286,6 +499,19 @@ if __name__ == "__main__":
                   help="Set the version of the application dSYM corresponds to")
     parser.add_option("-d", "--build_dir", dest="build_dir",
                   help="Use for custom TARGET_BUILD_DIR", default=os.environ.get('TARGET_BUILD_DIR'))
+    # bugsee-cli override knobs. See the resolver block near the top of
+    # this file for the full precedence rules.
+    parser.add_option("--cli-path", dest="cli_path",
+                  default=os.environ.get("BUGSEE_CLI_PATH"),
+                  help="Path to a local bugsee-cli binary. When set and the file "
+                       "is executable, this binary is used for symbol upload "
+                       "instead of the auto-downloaded one. Lets developers test "
+                       "a locally-built CLI without touching the on-disk cache.")
+    parser.add_option("--cli-version", dest="cli_version",
+                  default=os.environ.get("BUGSEE_CLI_VERSION"),
+                  help="bugsee-cli version to auto-download when --cli-path is "
+                       "unset. Defaults to BUGSEE_CLI_DEFAULT_VERSION (pinned to "
+                       "the version this agent was shipped against).")
     (options, args) = parser.parse_args()
 
     if options.from_xcode:

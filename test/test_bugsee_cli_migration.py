@@ -1,0 +1,744 @@
+#!/usr/bin/env python3
+"""Tests for the bugsee-cli migration in BugseeAgent.
+
+Loads BugseeAgent as a module (it has no .py extension) and exercises
+the CLI resolver, version-fallback chain, dSYM walk, and main() flow
+with all external commands (dwarfdump, dsymutil, tar, bugsee-cli) and
+all HTTP calls (urllib) mocked.
+
+Each test asserts something specific about behaviour — argv shape that
+the bugsee-cli binary will see, the host-triple → URL mapping that
+download requests will use, what happens on a SHA-256 mismatch, etc. —
+NOT just "the function returned non-None". A future regression in the
+production path is meant to make one of these tests fail loudly, not
+slip past a coverage report.
+
+Run from the repo root:
+    python3 -m unittest discover -s test -v
+
+Or directly:
+    python3 -m unittest test.test_bugsee_cli_migration -v
+"""
+
+import hashlib
+import importlib.util
+import io
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import ANY, MagicMock, patch
+
+
+# ──────────────────────────────────────────────────────────────────
+# Load BugseeAgent as a module. It has no .py extension and lives at
+# the repo root, so importlib.util is the cleanest path. Module-level
+# code in BugseeAgent only defines functions/constants — the
+# `if __name__ == "__main__"` block (option parsing, daemonize) does
+# NOT run on import, which is what we want.
+# ──────────────────────────────────────────────────────────────────
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_BUGSEE_AGENT_PATH = os.path.normpath(os.path.join(_HERE, "..", "BugseeAgent"))
+# BugseeAgent has no .py extension so spec_from_file_location can't pick
+# a loader by suffix. Construct a SourceFileLoader explicitly instead.
+import importlib.machinery
+_loader = importlib.machinery.SourceFileLoader(
+    "bugsee_agent_under_test", _BUGSEE_AGENT_PATH,
+)
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+agent = importlib.util.module_from_spec(_spec)
+_loader.exec_module(agent)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Host triple detection — the auto-download URL is built from this,
+# so a mismatch here means the plugin downloads a 404.
+# ──────────────────────────────────────────────────────────────────
+class TestDetectHostTriple(unittest.TestCase):
+    def _mock(self, system, machine):
+        return patch.multiple(
+            agent.platform,
+            system=MagicMock(return_value=system),
+            machine=MagicMock(return_value=machine),
+        )
+
+    def test_macos_apple_silicon_arm64(self):
+        with self._mock("Darwin", "arm64"):
+            self.assertEqual(agent.detectHostTriple(), "aarch64-apple-darwin")
+
+    def test_macos_apple_silicon_aarch64_alias(self):
+        # Some Pythons report machine as `aarch64` even on Apple Silicon.
+        with self._mock("Darwin", "aarch64"):
+            self.assertEqual(agent.detectHostTriple(), "aarch64-apple-darwin")
+
+    def test_macos_intel_x86_64(self):
+        with self._mock("Darwin", "x86_64"):
+            self.assertEqual(agent.detectHostTriple(), "x86_64-apple-darwin")
+
+    def test_macos_intel_amd64_alias(self):
+        with self._mock("Darwin", "amd64"):
+            self.assertEqual(agent.detectHostTriple(), "x86_64-apple-darwin")
+
+    def test_linux_arm64(self):
+        with self._mock("Linux", "aarch64"):
+            self.assertEqual(agent.detectHostTriple(), "aarch64-unknown-linux-gnu")
+
+    def test_linux_amd64(self):
+        with self._mock("Linux", "x86_64"):
+            self.assertEqual(agent.detectHostTriple(), "x86_64-unknown-linux-gnu")
+
+    def test_windows_amd64(self):
+        with self._mock("Windows", "AMD64"):
+            self.assertEqual(agent.detectHostTriple(), "x86_64-pc-windows-msvc")
+
+    def test_unsupported_freebsd_returns_none(self):
+        # dist does not publish a FreeBSD target; returning None lets
+        # the caller fall back / skip rather than 404.
+        with self._mock("FreeBSD", "x86_64"):
+            self.assertIsNone(agent.detectHostTriple())
+
+    def test_unsupported_windows_arm64_returns_none(self):
+        # No Windows ARM64 binary as of v0.1.x.
+        with self._mock("Windows", "ARM64"):
+            self.assertIsNone(agent.detectHostTriple())
+
+    def test_unsupported_linux_i386_returns_none(self):
+        with self._mock("Linux", "i386"):
+            self.assertIsNone(agent.detectHostTriple())
+
+
+# ──────────────────────────────────────────────────────────────────
+# resolveCli — orchestrates explicit-path / cache-hit / auto-download
+# layers. Tests use a controlled $HOME so production caches are
+# untouched.
+# ──────────────────────────────────────────────────────────────────
+class TestResolveCli(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.fake_home = os.path.join(self.tmp, "home")
+        os.makedirs(self.fake_home, exist_ok=True)
+        self._old_env = {
+            "HOME": os.environ.get("HOME"),
+            "BUGSEE_CLI_PATH": os.environ.get("BUGSEE_CLI_PATH"),
+            "BUGSEE_CLI_VERSION": os.environ.get("BUGSEE_CLI_VERSION"),
+        }
+        os.environ["HOME"] = self.fake_home
+        os.environ.pop("BUGSEE_CLI_PATH", None)
+        os.environ.pop("BUGSEE_CLI_VERSION", None)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        for k, v in self._old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _make_executable(self, path, content="#!/bin/sh\nexit 0\n"):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+        os.chmod(path, 0o755)
+
+    def test_explicit_path_executable_returns_verbatim(self):
+        bin_path = os.path.join(self.tmp, "my-cli")
+        self._make_executable(bin_path)
+        self.assertEqual(agent.resolveCli(cliPath=bin_path), bin_path)
+
+    def test_explicit_env_var_path_executable_returns_verbatim(self):
+        bin_path = os.path.join(self.tmp, "env-cli")
+        self._make_executable(bin_path)
+        os.environ["BUGSEE_CLI_PATH"] = bin_path
+        self.assertEqual(agent.resolveCli(), bin_path)
+
+    def test_explicit_path_missing_falls_through_to_download(self):
+        # When the explicit path is unusable AND auto-download fails
+        # (unsupported triple), we expect None — not an exception.
+        with patch.object(agent, "detectHostTriple", return_value=None):
+            self.assertIsNone(agent.resolveCli(cliPath="/no/such/file"))
+
+    def test_unsupported_host_returns_none_without_download(self):
+        with patch.object(agent, "detectHostTriple", return_value=None), \
+             patch.object(agent, "_downloadCli") as mock_dl:
+            self.assertIsNone(agent.resolveCli())
+            mock_dl.assert_not_called()
+
+    def test_cache_hit_returns_immediately_without_download(self):
+        triple = "aarch64-apple-darwin"
+        cache_bin = os.path.join(
+            self.fake_home, ".bugsee", "cli", "0.1.1", triple, "bugsee-cli",
+        )
+        self._make_executable(cache_bin)
+        with patch.object(agent, "detectHostTriple", return_value=triple), \
+             patch.object(agent, "_downloadCli") as mock_dl:
+            self.assertEqual(agent.resolveCli(), cache_bin)
+            mock_dl.assert_not_called()
+
+    def test_uses_custom_cli_version(self):
+        # Custom version → cache dir contains custom version, not the default.
+        triple = "aarch64-apple-darwin"
+        cache_bin = os.path.join(
+            self.fake_home, ".bugsee", "cli", "9.9.9", triple, "bugsee-cli",
+        )
+        self._make_executable(cache_bin)
+        with patch.object(agent, "detectHostTriple", return_value=triple):
+            self.assertEqual(agent.resolveCli(cliVersion="9.9.9"), cache_bin)
+
+    def test_env_cli_version_overrides_default(self):
+        os.environ["BUGSEE_CLI_VERSION"] = "0.2.3"
+        triple = "x86_64-apple-darwin"
+        cache_bin = os.path.join(
+            self.fake_home, ".bugsee", "cli", "0.2.3", triple, "bugsee-cli",
+        )
+        self._make_executable(cache_bin)
+        with patch.object(agent, "detectHostTriple", return_value=triple):
+            self.assertEqual(agent.resolveCli(), cache_bin)
+
+    def test_download_exception_returns_none_not_raise(self):
+        # A network failure (or 404, SHA mismatch, etc.) inside
+        # _downloadCli must surface as a soft failure — main() needs
+        # the option to skip without crashing the build.
+        with patch.object(agent, "detectHostTriple", return_value="aarch64-apple-darwin"), \
+             patch.object(agent, "_downloadCli", side_effect=IOError("network down")):
+            self.assertIsNone(agent.resolveCli())
+
+    def test_download_succeeds_then_binary_returned(self):
+        triple = "aarch64-apple-darwin"
+        cache_dir = os.path.join(self.fake_home, ".bugsee", "cli", "0.1.1", triple)
+        cache_bin = os.path.join(cache_dir, "bugsee-cli")
+
+        def fake_download(version, target_triple, target_dir):
+            # Simulate what _downloadCli does on success.
+            self.assertEqual(version, "0.1.1")
+            self.assertEqual(target_triple, triple)
+            self.assertEqual(target_dir, cache_dir)
+            self._make_executable(cache_bin)
+
+        with patch.object(agent, "detectHostTriple", return_value=triple), \
+             patch.object(agent, "_downloadCli", side_effect=fake_download):
+            self.assertEqual(agent.resolveCli(), cache_bin)
+
+
+# ──────────────────────────────────────────────────────────────────
+# _downloadCli — verifies the URL constructed, that the SHA-256
+# sidecar gates the extraction, and that the wrong checksum is fatal.
+# ──────────────────────────────────────────────────────────────────
+class TestDownloadCli(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _stub_urlopen(self, payloads):
+        """Return a factory yielding a file-like response for each URL in
+        `payloads` (dict mapping URL → bytes). Uses io.BytesIO so
+        subsequent `read()` calls return empty bytes (EOF) naturally —
+        critical because `shutil.copyfileobj` loops on read(), and a
+        MagicMock with `return_value=payload` would yield the same
+        non-empty bytes forever (CPU spin + unbounded mock_calls list,
+        observed as a tens-of-GB memory blow-up).
+
+        An unknown URL raises so an unexpected fetch fails loudly
+        instead of silently returning empty bytes."""
+        def factory(url, *args, **kwargs):
+            self.assertIn(url, payloads, f"unexpected GET to {url}")
+            return io.BytesIO(payloads[url])
+        return factory
+
+    def test_unix_url_uses_tar_xz(self):
+        # On Unix triples, the artifact extension is .tar.xz.
+        # The SHA sidecar comes from the same URL plus `.sha256`.
+        tarball_bytes = b"fake tarball contents"
+        expected_sha = hashlib.sha256(tarball_bytes).hexdigest()
+        urls = {
+            "https://download.bugsee.com/cli/v0.1.1/bugsee-cli-aarch64-apple-darwin.tar.xz":
+                tarball_bytes,
+            "https://download.bugsee.com/cli/v0.1.1/bugsee-cli-aarch64-apple-darwin.tar.xz.sha256":
+                f"{expected_sha}  bugsee-cli-aarch64-apple-darwin.tar.xz\n".encode(),
+        }
+        with patch.object(agent.urllib.request, "urlopen", side_effect=self._stub_urlopen(urls)), \
+             patch.object(agent.subprocess, "run") as mock_run:
+            # Successful tar extraction; produce the expected binary on disk
+            def fake_tar(cmd, *a, **k):
+                # cmd is ["tar", "-xf", tarball_path, "-C", cacheDir, "--strip-components=1"]
+                self.assertEqual(cmd[0], "tar")
+                self.assertEqual(cmd[1], "-xf")
+                self.assertEqual(cmd[3], "-C")
+                self.assertEqual(cmd[4], self.tmp)
+                self.assertEqual(cmd[5], "--strip-components=1")
+                # Write the binary that downloadCli expects to find at the end.
+                with open(os.path.join(self.tmp, "bugsee-cli"), "w") as f:
+                    f.write("binary")
+                return MagicMock(returncode=0, stderr="")
+            mock_run.side_effect = fake_tar
+            agent._downloadCli("0.1.1", "aarch64-apple-darwin", self.tmp)
+            # Binary should now be present + executable.
+            bin_path = os.path.join(self.tmp, "bugsee-cli")
+            self.assertTrue(os.path.isfile(bin_path))
+            self.assertTrue(os.access(bin_path, os.X_OK))
+
+    def test_windows_url_uses_zip(self):
+        # On Windows triples the artifact extension flips to .zip.
+        tarball_bytes = b"fake zip contents"
+        expected_sha = hashlib.sha256(tarball_bytes).hexdigest()
+        urls = {
+            "https://download.bugsee.com/cli/v0.1.1/bugsee-cli-x86_64-pc-windows-msvc.zip":
+                tarball_bytes,
+            "https://download.bugsee.com/cli/v0.1.1/bugsee-cli-x86_64-pc-windows-msvc.zip.sha256":
+                f"{expected_sha}  bugsee-cli-x86_64-pc-windows-msvc.zip\n".encode(),
+        }
+        with patch.object(agent.urllib.request, "urlopen", side_effect=self._stub_urlopen(urls)), \
+             patch.object(agent.subprocess, "run") as mock_run:
+            def fake_tar(cmd, *a, **k):
+                # On Windows the binary inside is bugsee-cli.exe
+                with open(os.path.join(self.tmp, "bugsee-cli.exe"), "w") as f:
+                    f.write("binary")
+                return MagicMock(returncode=0, stderr="")
+            mock_run.side_effect = fake_tar
+            agent._downloadCli("0.1.1", "x86_64-pc-windows-msvc", self.tmp)
+            self.assertTrue(os.path.isfile(os.path.join(self.tmp, "bugsee-cli.exe")))
+
+    def test_sha_mismatch_raises_and_removes_tarball(self):
+        # An attacker (or a corrupted CDN cache) shipping different
+        # bytes than the published checksum must result in a hard
+        # error — not silent installation of unverified content.
+        tarball_bytes = b"these bytes will not match the sidecar's SHA"
+        bogus_sha = "0" * 64
+        urls = {
+            "https://download.bugsee.com/cli/v0.1.1/bugsee-cli-aarch64-apple-darwin.tar.xz":
+                tarball_bytes,
+            "https://download.bugsee.com/cli/v0.1.1/bugsee-cli-aarch64-apple-darwin.tar.xz.sha256":
+                f"{bogus_sha}  bugsee-cli-aarch64-apple-darwin.tar.xz\n".encode(),
+        }
+        with patch.object(agent.urllib.request, "urlopen", side_effect=self._stub_urlopen(urls)), \
+             patch.object(agent.subprocess, "run") as mock_run:
+            with self.assertRaises(IOError) as ctx:
+                agent._downloadCli("0.1.1", "aarch64-apple-darwin", self.tmp)
+            self.assertIn("SHA-256 mismatch", str(ctx.exception))
+            # tar should NEVER have been invoked because verify happens first
+            mock_run.assert_not_called()
+            # The bad tarball should have been deleted, not left behind
+            self.assertFalse(os.path.exists(
+                os.path.join(self.tmp, "bugsee-cli-aarch64-apple-darwin.tar.xz")
+            ))
+
+    def test_sha_sidecar_with_asterisk_binary_mode_marker_parses(self):
+        # sha256sum's "binary mode" format is `<hex> *<filename>`.
+        # Must still extract the hex correctly.
+        tarball_bytes = b"fake tarball"
+        expected_sha = hashlib.sha256(tarball_bytes).hexdigest()
+        urls = {
+            "https://download.bugsee.com/cli/v0.1.1/bugsee-cli-x86_64-unknown-linux-gnu.tar.xz":
+                tarball_bytes,
+            "https://download.bugsee.com/cli/v0.1.1/bugsee-cli-x86_64-unknown-linux-gnu.tar.xz.sha256":
+                f"{expected_sha} *bugsee-cli-x86_64-unknown-linux-gnu.tar.xz\n".encode(),
+        }
+        with patch.object(agent.urllib.request, "urlopen", side_effect=self._stub_urlopen(urls)), \
+             patch.object(agent.subprocess, "run") as mock_run:
+            def fake_tar(cmd, *a, **k):
+                with open(os.path.join(self.tmp, "bugsee-cli"), "w") as f:
+                    f.write("binary")
+                return MagicMock(returncode=0, stderr="")
+            mock_run.side_effect = fake_tar
+            # Should NOT raise SHA mismatch — the asterisk is just a mode marker.
+            agent._downloadCli("0.1.1", "x86_64-unknown-linux-gnu", self.tmp)
+
+    def test_tar_failure_raises_ioerror_with_stderr(self):
+        # tar non-zero exit should surface a useful error message.
+        tarball_bytes = b"fake tarball"
+        expected_sha = hashlib.sha256(tarball_bytes).hexdigest()
+        urls = {
+            "https://download.bugsee.com/cli/v0.1.1/bugsee-cli-x86_64-apple-darwin.tar.xz":
+                tarball_bytes,
+            "https://download.bugsee.com/cli/v0.1.1/bugsee-cli-x86_64-apple-darwin.tar.xz.sha256":
+                f"{expected_sha}\n".encode(),
+        }
+        with patch.object(agent.urllib.request, "urlopen", side_effect=self._stub_urlopen(urls)), \
+             patch.object(agent.subprocess, "run", return_value=MagicMock(
+                returncode=2, stderr="tar: bad header\n")):
+            with self.assertRaises(IOError) as ctx:
+                agent._downloadCli("0.1.1", "x86_64-apple-darwin", self.tmp)
+            self.assertIn("tar -xf", str(ctx.exception))
+            self.assertIn("bad header", str(ctx.exception))
+
+
+# ──────────────────────────────────────────────────────────────────
+# uploadDsymViaCli — the argv shape the bugsee-cli binary receives is
+# a wire contract: a future rename of any CLI flag must surface here.
+# ──────────────────────────────────────────────────────────────────
+class TestUploadDsymViaCli(unittest.TestCase):
+    def test_argv_shape_pinned(self):
+        with patch.object(agent.subprocess, "run", return_value=MagicMock(returncode=0)) as mock_run:
+            ok = agent.uploadDsymViaCli(
+                "/path/to/bugsee-cli",
+                "/path/to/Foo.dSYM",
+                "the-app-token",
+                "https://apidev.bugsee.com",
+                "1.2.3",
+                "42",
+            )
+            self.assertTrue(ok)
+            mock_run.assert_called_once()
+            argv = mock_run.call_args[0][0]
+            self.assertEqual(argv, [
+                "/path/to/bugsee-cli",
+                "--endpoint", "https://apidev.bugsee.com",
+                "--app-token", "the-app-token",
+                "debug-files", "upload",
+                "--type", "dsym",
+                "--version", "1.2.3",
+                "--build", "42",
+                "/path/to/Foo.dSYM",
+            ])
+
+    def test_returns_false_on_nonzero_exit(self):
+        with patch.object(agent.subprocess, "run", return_value=MagicMock(returncode=30)):
+            self.assertFalse(agent.uploadDsymViaCli(
+                "/x", "/y", "t", "e", "v", "b"))
+
+    def test_returns_false_on_subprocess_exception(self):
+        # OSError can happen if the binary is unexpectedly removed
+        # mid-run, or if the kernel refuses the exec (wrong arch).
+        with patch.object(agent.subprocess, "run", side_effect=OSError("ENOEXEC")):
+            self.assertFalse(agent.uploadDsymViaCli(
+                "/x", "/y", "t", "e", "v", "b"))
+
+    def test_none_version_and_build_pass_empty_string(self):
+        # The CLI requires non-empty values; we substitute "" to make
+        # the failure observable downstream rather than passing literal
+        # "None" strings.
+        with patch.object(agent.subprocess, "run", return_value=MagicMock(returncode=0)) as mock_run:
+            agent.uploadDsymViaCli("/cli", "/dsym", "t", "e", None, None)
+            argv = mock_run.call_args[0][0]
+            self.assertIn("--version", argv)
+            self.assertIn("--build", argv)
+            v_idx = argv.index("--version")
+            b_idx = argv.index("--build")
+            self.assertEqual(argv[v_idx + 1], "")
+            self.assertEqual(argv[b_idx + 1], "")
+
+
+# ──────────────────────────────────────────────────────────────────
+# parseDSYM — UUID extraction from dwarfdump output. Real dwarfdump
+# is mocked so tests are macOS/Linux portable.
+# ──────────────────────────────────────────────────────────────────
+class TestParseDSYM(unittest.TestCase):
+    def _stub_dwarfdump(self, stdout):
+        return patch.object(
+            agent.subprocess, "run",
+            return_value=MagicMock(stdout=stdout, returncode=0),
+        )
+
+    def test_single_arch_dsym(self):
+        out = "UUID: 54D75FB3-747F-387F-8A93-4EA034B1F8CF (x86_64) /path/binary\n"
+        with self._stub_dwarfdump(out):
+            self.assertEqual(
+                agent.parseDSYM("/path/binary"),
+                ["54D75FB3-747F-387F-8A93-4EA034B1F8CF"],
+            )
+
+    def test_multi_arch_fat_dsym(self):
+        out = (
+            "UUID: 54D75FB3-747F-387F-8A93-4EA034B1F8CF (x86_64) /path/binary\n"
+            "UUID: 831BB3B1-C969-3638-B7F5-BF43B3CF8AB3 (arm64) /path/binary\n"
+        )
+        with self._stub_dwarfdump(out):
+            self.assertEqual(
+                agent.parseDSYM("/path/binary"),
+                [
+                    "54D75FB3-747F-387F-8A93-4EA034B1F8CF",
+                    "831BB3B1-C969-3638-B7F5-BF43B3CF8AB3",
+                ],
+            )
+
+    def test_dwarfdump_nonzero_exit_returns_empty(self):
+        # Corrupt or non-Mach-O input must surface as empty list, not crash.
+        with patch.object(
+            agent.subprocess, "run",
+            side_effect=subprocess.CalledProcessError(1, "dwarfdump"),
+        ):
+            self.assertEqual(agent.parseDSYM("/bad/file"), [])
+
+    def test_no_uuid_lines_in_output(self):
+        # dwarfdump might emit only warnings/headers; no UUID line.
+        with self._stub_dwarfdump("warning: file is not a debug-info-bearing Mach-O\n"):
+            self.assertEqual(agent.parseDSYM("/path"), [])
+
+
+# ──────────────────────────────────────────────────────────────────
+# Cache file helpers — the "already uploaded UUIDs" short-circuit
+# saves a CLI exec + HTTP round-trip per duplicate.
+# ──────────────────────────────────────────────────────────────────
+class TestUploadedListCache(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._old_home = os.environ.get("HOME")
+        os.environ["HOME"] = self.tmp
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        if self._old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._old_home
+
+    def test_load_when_file_missing_returns_empty(self):
+        self.assertEqual(agent.loadUploadedList(), [])
+
+    def test_save_then_load_roundtrip_preserves_uuids(self):
+        uuids = [
+            "54D75FB3-747F-387F-8A93-4EA034B1F8CF",
+            "831BB3B1-C969-3638-B7F5-BF43B3CF8AB3",
+        ]
+        agent.saveUploadedList(uuids)
+        self.assertEqual(agent.loadUploadedList(), uuids)
+
+    def test_in_uploaded_list_partial_overlap(self):
+        existing = ["A", "B", "C"]
+        # A single overlapping UUID is enough to mark the dSYM as seen
+        # (because we'd be uploading bytes the server already has).
+        self.assertTrue(agent.isInUploadedList(["B"], existing))
+        self.assertTrue(agent.isInUploadedList(["X", "B"], existing))
+
+    def test_in_uploaded_list_no_overlap(self):
+        self.assertFalse(agent.isInUploadedList(["X", "Y"], ["A", "B"]))
+
+    def test_in_uploaded_list_empty_inputs(self):
+        self.assertFalse(agent.isInUploadedList([], []))
+        self.assertFalse(agent.isInUploadedList([], ["A"]))
+        self.assertFalse(agent.isInUploadedList(["A"], []))
+
+
+# ──────────────────────────────────────────────────────────────────
+# Integration: full main() flow with all subprocess + HTTP calls
+# mocked. Verifies the bugsee-cli binary IS exec'd per dSYM with the
+# correct argv, that the cache is updated only on success, and that
+# the version/build fallback chain works.
+# ──────────────────────────────────────────────────────────────────
+class TestMainIntegration(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.fake_home = os.path.join(self.tmp, "home")
+        os.makedirs(self.fake_home)
+        self._old_home = os.environ.get("HOME")
+        os.environ["HOME"] = self.fake_home
+        # Drop the cache file if it exists in the fake home.
+        cache = os.path.join(self.fake_home, ".bugseeUploadList")
+        if os.path.exists(cache):
+            os.unlink(cache)
+
+        # Build two synthetic .dSYM bundles under self.tmp.
+        self.dsym_a = os.path.join(self.tmp, "Foo.dSYM")
+        self.dwarf_a = os.path.join(self.dsym_a, "Contents", "Resources", "DWARF")
+        os.makedirs(self.dwarf_a)
+        with open(os.path.join(self.dwarf_a, "Foo"), "w") as f:
+            f.write("synthetic Mach-O bytes")
+
+        self.dsym_b = os.path.join(self.tmp, "Bar.dSYM")
+        self.dwarf_b = os.path.join(self.dsym_b, "Contents", "Resources", "DWARF")
+        os.makedirs(self.dwarf_b)
+        with open(os.path.join(self.dwarf_b, "Bar"), "w") as f:
+            f.write("synthetic Mach-O bytes")
+
+        # Fake bugsee-cli binary.
+        self.cli_path = os.path.join(self.tmp, "bugsee-cli")
+        with open(self.cli_path, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(self.cli_path, 0o755)
+
+        # Synthesize the `options` namespace main() reads from. The
+        # real entry point's option-parsing block is not executed when
+        # we import BugseeAgent as a module, so we fabricate a stand-in.
+        self.options = type("Opts", (), {
+            "version": None,
+            "build": None,
+            "dsym_list": False,
+            "dsym_folder": self.tmp,
+            "symbol_maps": None,
+            "endpoint": "https://apidev.bugsee.com",
+            "cli_path": self.cli_path,
+            "cli_version": None,
+            "from_xcode": False,
+            "build_dir": None,
+            "collect_deps": False,
+        })()
+
+    def tearDown(self):
+        if self._old_home is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = self._old_home
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _setup_module_state(self, version, build):
+        """Install `options`/`args`/`APP_TOKEN` at module level so
+        main() can read them the same way it does at runtime."""
+        self.options.version = version
+        self.options.build = build
+        agent.options = self.options
+        agent.args = ["the-token"]
+        agent.APP_TOKEN = "the-token"
+
+    def test_uploads_each_dsym_via_cli_with_correct_argv(self):
+        self._setup_module_state(version="1.2.3", build="42")
+        # Synthetic dwarfdump output for each binary inside DWARF/.
+        # Different UUIDs per dSYM so the cache distinguishes them.
+        dwarf_outputs = {
+            os.path.join(self.dwarf_a, "Foo"):
+                "UUID: AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA (arm64) /x/Foo\n",
+            os.path.join(self.dwarf_b, "Bar"):
+                "UUID: BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB (arm64) /x/Bar\n",
+        }
+
+        cli_calls = []
+
+        def fake_subprocess_run(cmd, *a, **k):
+            if cmd[0] == "/usr/bin/dwarfdump":
+                # dwarfdump returns a fake UUID per file.
+                return MagicMock(stdout=dwarf_outputs.get(cmd[2], ""), returncode=0)
+            if cmd[0] == self.cli_path:
+                cli_calls.append(list(cmd))
+                return MagicMock(returncode=0)
+            raise AssertionError("unexpected subprocess: %r" % cmd)
+
+        with patch.object(agent.subprocess, "run", side_effect=fake_subprocess_run):
+            agent.main()
+
+        self.assertEqual(len(cli_calls), 2,
+            "exactly one CLI invocation per dSYM expected; got %r" % cli_calls)
+        # Both invocations point at distinct .dSYM bundle directories.
+        dsym_paths = sorted(call[-1] for call in cli_calls)
+        self.assertEqual(dsym_paths, sorted([self.dsym_a, self.dsym_b]))
+        # Every invocation carries the version/build supplied via options.
+        for cmd in cli_calls:
+            self.assertEqual(cmd[cmd.index("--version") + 1], "1.2.3")
+            self.assertEqual(cmd[cmd.index("--build") + 1], "42")
+            self.assertEqual(cmd[cmd.index("--app-token") + 1], "the-token")
+            self.assertEqual(cmd[cmd.index("--type") + 1], "dsym")
+
+    def test_cache_hit_skips_cli_exec(self):
+        self._setup_module_state(version="1.0", build="1")
+        # Pre-populate the cache with both UUIDs so both dSYMs are
+        # already considered "uploaded".
+        seeded_uuids = ["AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+                        "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"]
+        agent.saveUploadedList(seeded_uuids)
+        dwarf_outputs = {
+            os.path.join(self.dwarf_a, "Foo"):
+                "UUID: AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA (arm64) /Foo\n",
+            os.path.join(self.dwarf_b, "Bar"):
+                "UUID: BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB (arm64) /Bar\n",
+        }
+        cli_calls = []
+
+        def fake_subprocess_run(cmd, *a, **k):
+            if cmd[0] == "/usr/bin/dwarfdump":
+                return MagicMock(stdout=dwarf_outputs.get(cmd[2], ""), returncode=0)
+            if cmd[0] == self.cli_path:
+                cli_calls.append(list(cmd))
+                return MagicMock(returncode=0)
+            raise AssertionError("unexpected subprocess: %r" % cmd)
+
+        with patch.object(agent.subprocess, "run", side_effect=fake_subprocess_run):
+            agent.main()
+
+        self.assertEqual(cli_calls, [],
+            "cache-hit dSYMs must not trigger any CLI exec; got %r" % cli_calls)
+
+    def test_cache_only_updated_on_successful_upload(self):
+        # If CLI returns non-zero, the UUIDs from that dSYM must NOT
+        # land in ~/.bugseeUploadList — otherwise a failure would
+        # silently block all retries.
+        self._setup_module_state(version="1.0", build="1")
+        dwarf_outputs = {
+            os.path.join(self.dwarf_a, "Foo"):
+                "UUID: AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA (arm64) /Foo\n",
+            os.path.join(self.dwarf_b, "Bar"):
+                "UUID: BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB (arm64) /Bar\n",
+        }
+        # A returns ok, B fails.
+        def fake_subprocess_run(cmd, *a, **k):
+            if cmd[0] == "/usr/bin/dwarfdump":
+                return MagicMock(stdout=dwarf_outputs.get(cmd[2], ""), returncode=0)
+            if cmd[0] == self.cli_path:
+                # Distinguish by the dSYM path passed.
+                if cmd[-1] == self.dsym_b:
+                    return MagicMock(returncode=30)
+                return MagicMock(returncode=0)
+            raise AssertionError("unexpected: %r" % cmd)
+
+        with patch.object(agent.subprocess, "run", side_effect=fake_subprocess_run):
+            agent.main()
+
+        cached = agent.loadUploadedList()
+        self.assertIn("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA", cached,
+            "successful dSYM's UUID must persist to cache")
+        self.assertNotIn("BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB", cached,
+            "failed dSYM's UUID must NOT persist — next run should retry")
+
+    def test_no_version_no_build_no_fallback_skips_upload(self):
+        # When neither --version/--build nor any fallback supplies
+        # values, the run must NOT attempt to exec CLI (which would
+        # error out). Instead it logs and skips, leaving the cache
+        # untouched so the next run can retry once values become
+        # available.
+        self._setup_module_state(version=None, build=None)
+        # Make getVersionAndBuild return (None, None) too.
+        dwarf_outputs = {
+            os.path.join(self.dwarf_a, "Foo"):
+                "UUID: AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA (arm64) /Foo\n",
+            os.path.join(self.dwarf_b, "Bar"):
+                "UUID: BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB (arm64) /Bar\n",
+        }
+        cli_calls = []
+
+        def fake_subprocess_run(cmd, *a, **k):
+            if cmd[0] == "/usr/bin/dwarfdump":
+                return MagicMock(stdout=dwarf_outputs.get(cmd[2], ""), returncode=0)
+            if cmd[0] == self.cli_path:
+                cli_calls.append(list(cmd))
+                return MagicMock(returncode=0)
+            raise AssertionError("unexpected: %r" % cmd)
+
+        with patch.object(agent.subprocess, "run", side_effect=fake_subprocess_run), \
+             patch.object(agent, "getVersionAndBuild", return_value=(None, None)):
+            agent.main()
+        self.assertEqual(cli_calls, [],
+            "no version/build means no CLI exec; got %r" % cli_calls)
+
+    def test_fallback_to_getVersionAndBuild_when_flags_missing(self):
+        # Flags missing, but getVersionAndBuild produces values (the
+        # Xcode build-phase Info.plist path). Those values must reach
+        # the CLI exec.
+        self._setup_module_state(version=None, build=None)
+        dwarf_out = (
+            "UUID: AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA (arm64) /Foo\n"
+        )
+        cli_calls = []
+
+        def fake_subprocess_run(cmd, *a, **k):
+            if cmd[0] == "/usr/bin/dwarfdump":
+                # Same UUID for both files — collapse to 1 upload via
+                # cache-aware dedup-in-DSYM logic.
+                return MagicMock(stdout=dwarf_out, returncode=0)
+            if cmd[0] == self.cli_path:
+                cli_calls.append(list(cmd))
+                return MagicMock(returncode=0)
+            raise AssertionError("unexpected: %r" % cmd)
+
+        with patch.object(agent.subprocess, "run", side_effect=fake_subprocess_run), \
+             patch.object(agent, "getVersionAndBuild", return_value=("9.9", "777")):
+            agent.main()
+
+        self.assertTrue(cli_calls, "expected at least one CLI invocation")
+        # Every invocation must have the fallback values.
+        for cmd in cli_calls:
+            self.assertEqual(cmd[cmd.index("--version") + 1], "9.9")
+            self.assertEqual(cmd[cmd.index("--build") + 1], "777")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

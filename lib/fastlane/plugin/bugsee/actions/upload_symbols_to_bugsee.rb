@@ -41,7 +41,7 @@ module Fastlane
           command << "-v #{version}" if version
           command << "-b #{build}" if build
           command << "-d #{build_dir}"
-          command << "-m #{maps}" if symbol_maps
+          command << "-m #{symbol_maps}" if symbol_maps
           command << "-x -l #{app_token}"
           command += dsym_paths
           begin
