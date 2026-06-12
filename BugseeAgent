@@ -1658,7 +1658,56 @@ def loadUploadedList():
     except Exception as error:
         return []
 
+def _parse_dsym_via_cli(fullPath):
+    """Shell to `bugsee-cli dsym uuid <path>` for the UUID list.
+    Returns a list of UUID strings on success, or None on any
+    failure. Part of the Option-C migration that moved dSYM UUID
+    extraction to the Rust CLI (which keys off
+    `symbolic-debuginfo`'s Mach-O parser — no `/usr/bin/dwarfdump`
+    dependency)."""
+    if not fullPath:
+        return None
+    cli_path_opt = None
+    cli_version_opt = None
+    try:
+        cli_path_opt = getattr(options, 'cli_path', None)
+        cli_version_opt = getattr(options, 'cli_version', None)
+    except NameError:
+        pass
+    cli = resolveCli(cli_path_opt, cli_version_opt)
+    if not cli:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, "dsym", "uuid", fullPath],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        if not out:
+            return None
+        data = json.loads(out)
+        if not isinstance(data, list):
+            return None
+        # Each entry must be a UUID string.
+        return [str(u) for u in data if isinstance(u, str)]
+    except (OSError, ValueError, TypeError,
+            subprocess.CalledProcessError):
+        return None
+
+
 def parseDSYM(fullPath):
+    """Extract Mach-O UUIDs from a dSYM bundle or Mach-O binary.
+
+    Prefers `bugsee-cli dsym uuid` (canonical Rust implementation;
+    no /usr/bin/dwarfdump dependency). Falls back to the in-
+    process dwarfdump shell-out below when the CLI isn't
+    available."""
+    via_cli = _parse_dsym_via_cli(fullPath)
+    if via_cli is not None:
+        return via_cli
+
     images = []
     try:
         out = subprocess.run(['/usr/bin/dwarfdump', '-u', fullPath], check=True, capture_output=True, text=True).stdout

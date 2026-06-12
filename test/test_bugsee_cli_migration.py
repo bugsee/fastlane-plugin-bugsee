@@ -24,6 +24,7 @@ import hashlib
 import importlib.util
 import io
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -590,6 +591,96 @@ class TestParseDSYM(unittest.TestCase):
         with self._stub_dwarfdump("warning: file is not a debug-info-bearing Mach-O\n"):
             self.assertEqual(agent.parseDSYM("/path"), [])
 
+    # ── Option-C migration: `bugsee-cli dsym uuid` ──────────────────
+
+    def test_uses_cli_subcommand_when_cli_is_available(self):
+        # Production parseDSYM tries `bugsee-cli dsym uuid` first.
+        # When the CLI returns a valid JSON array, that wins and
+        # dwarfdump is never invoked.
+        canned = '["54D75FB3-747F-387F-8A93-4EA034B1F8CF",' \
+                 '"831BB3B1-C969-3638-B7F5-BF43B3CF8AB3"]'
+        with patch.object(agent, 'resolveCli',
+                          return_value='/usr/local/bin/bugsee-cli'), \
+             patch.object(agent.subprocess, 'run',
+                          return_value=MagicMock(returncode=0, stdout=canned)) as run_mock:
+            result = agent.parseDSYM('/some/binary')
+        self.assertEqual(result, [
+            "54D75FB3-747F-387F-8A93-4EA034B1F8CF",
+            "831BB3B1-C969-3638-B7F5-BF43B3CF8AB3",
+        ])
+        argv = run_mock.call_args[0][0]
+        self.assertEqual(argv[0], '/usr/local/bin/bugsee-cli')
+        self.assertIn('dsym', argv)
+        self.assertIn('uuid', argv)
+        # The binary path is the last positional argument.
+        self.assertEqual(argv[-1], '/some/binary')
+
+    def test_falls_back_to_dwarfdump_when_cli_unavailable(self):
+        # resolveCli returns None → dwarfdump path runs. Verify
+        # the dwarfdump branch produces the expected UUID.
+        with patch.object(agent, 'resolveCli', return_value=None), \
+             self._stub_dwarfdump(
+                 "UUID: 11111111-1111-1111-1111-111111111111 (arm64) /x\n"):
+            result = agent.parseDSYM('/some/binary')
+        self.assertEqual(result, ["11111111-1111-1111-1111-111111111111"])
+
+    def test_falls_back_to_dwarfdump_on_cli_nonzero_exit(self):
+        # CLI exits 2 (older bugsee-cli without the subcommand)
+        # → dwarfdump fallback runs. The two subprocess.run calls
+        # are routed via a side_effect chain.
+        responses = [
+            MagicMock(returncode=2, stdout=''),  # CLI fails
+            MagicMock(returncode=0,
+                      stdout="UUID: 22222222-2222-2222-2222-222222222222 (arm64) /x\n"),
+        ]
+        with patch.object(agent, 'resolveCli', return_value='/cli'), \
+             patch.object(agent.subprocess, 'run',
+                          side_effect=responses):
+            result = agent.parseDSYM('/some/binary')
+        self.assertEqual(result, ["22222222-2222-2222-2222-222222222222"])
+
+    def test_falls_back_to_dwarfdump_on_malformed_cli_json(self):
+        # CLI returns garbage → ValueError → dwarfdump fallback.
+        responses = [
+            MagicMock(returncode=0, stdout='not json'),
+            MagicMock(returncode=0,
+                      stdout="UUID: 33333333-3333-3333-3333-333333333333 (arm64) /x\n"),
+        ]
+        with patch.object(agent, 'resolveCli', return_value='/cli'), \
+             patch.object(agent.subprocess, 'run',
+                          side_effect=responses):
+            result = agent.parseDSYM('/some/binary')
+        self.assertEqual(result, ["33333333-3333-3333-3333-333333333333"])
+
+    def test_falls_back_to_dwarfdump_on_oserror(self):
+        # CLI exec raises OSError (ENOEXEC, FileNotFoundError)
+        # → fallback to dwarfdump.
+        responses = [
+            OSError("ENOEXEC"),
+            MagicMock(returncode=0,
+                      stdout="UUID: 44444444-4444-4444-4444-444444444444 (arm64) /x\n"),
+        ]
+        with patch.object(agent, 'resolveCli', return_value='/cli'), \
+             patch.object(agent.subprocess, 'run',
+                          side_effect=responses):
+            result = agent.parseDSYM('/some/binary')
+        self.assertEqual(result, ["44444444-4444-4444-4444-444444444444"])
+
+    def test_cli_path_returns_empty_list_on_no_uuids(self):
+        # When the CLI succeeds with an empty array, parseDSYM
+        # returns [] and does NOT fall back to dwarfdump (the
+        # CLI is authoritative for "this file has no Mach-O
+        # UUIDs"). Same posture as the SDK's plist value
+        # subcommand.
+        with patch.object(agent, 'resolveCli', return_value='/cli'), \
+             patch.object(agent.subprocess, 'run',
+                          return_value=MagicMock(returncode=0, stdout='[]')) as run_mock:
+            result = agent.parseDSYM('/some/binary')
+        self.assertEqual(result, [])
+        # Exactly one subprocess.run call — the CLI. No dwarfdump
+        # fallback fired.
+        self.assertEqual(run_mock.call_count, 1)
+
 
 # ──────────────────────────────────────────────────────────────────
 # Cache file helpers — the "already uploaded UUIDs" short-circuit
@@ -718,11 +809,28 @@ class TestMainIntegration(unittest.TestCase):
 
         cli_calls = []
 
+        # The `bugsee-cli dsym uuid <macho>` subcommand (Option-C
+        # migration) is what parseDSYM now prefers. parseDSYM is
+        # called with the SAME Mach-O leaf path that dwarfdump
+        # would have received, so we key off `dwarf_outputs` and
+        # extract the UUID from its canned text output. cli_calls
+        # only counts the debug-files upload invocations.
+        def _dsym_uuid_json_for(macho_path):
+            text = dwarf_outputs.get(macho_path, "")
+            import json as _json
+            m = re.search(r'UUID:\s+([0-9A-Fa-f-]+)', text)
+            return _json.dumps([m.group(1)] if m else [])
+
         def fake_subprocess_run(cmd, *a, **k):
             if cmd[0] == "/usr/bin/dwarfdump":
                 # dwarfdump returns a fake UUID per file.
                 return MagicMock(stdout=dwarf_outputs.get(cmd[2], ""), returncode=0)
             if cmd[0] == self.cli_path:
+                if len(cmd) >= 3 and cmd[1] == "dsym" and cmd[2] == "uuid":
+                    return MagicMock(
+                        stdout=_dsym_uuid_json_for(cmd[3]),
+                        returncode=0,
+                    )
                 cli_calls.append(list(cmd))
                 return MagicMock(returncode=0)
             raise AssertionError("unexpected subprocess: %r" % cmd)
@@ -761,6 +869,14 @@ class TestMainIntegration(unittest.TestCase):
             if cmd[0] == "/usr/bin/dwarfdump":
                 return MagicMock(stdout=dwarf_outputs.get(cmd[2], ""), returncode=0)
             if cmd[0] == self.cli_path:
+                # `dsym uuid` is now used by parseDSYM (the Option-C
+                # dSYM UUID subcommand). Route to a canned empty
+                # JSON array so the fallback to dwarfdump fires
+                # for the actual UUID extraction; cli_calls only
+                # counts the debug-files upload invocations, which
+                # is what these tests pin.
+                if len(cmd) >= 3 and cmd[1] == "dsym" and cmd[2] == "uuid":
+                    return MagicMock(stdout="[]", returncode=0)
                 cli_calls.append(list(cmd))
                 return MagicMock(returncode=0)
             raise AssertionError("unexpected subprocess: %r" % cmd)
@@ -822,6 +938,14 @@ class TestMainIntegration(unittest.TestCase):
             if cmd[0] == "/usr/bin/dwarfdump":
                 return MagicMock(stdout=dwarf_outputs.get(cmd[2], ""), returncode=0)
             if cmd[0] == self.cli_path:
+                # `dsym uuid` is now used by parseDSYM (the Option-C
+                # dSYM UUID subcommand). Route to a canned empty
+                # JSON array so the fallback to dwarfdump fires
+                # for the actual UUID extraction; cli_calls only
+                # counts the debug-files upload invocations, which
+                # is what these tests pin.
+                if len(cmd) >= 3 and cmd[1] == "dsym" and cmd[2] == "uuid":
+                    return MagicMock(stdout="[]", returncode=0)
                 cli_calls.append(list(cmd))
                 return MagicMock(returncode=0)
             raise AssertionError("unexpected: %r" % cmd)
@@ -848,6 +972,18 @@ class TestMainIntegration(unittest.TestCase):
                 # cache-aware dedup-in-DSYM logic.
                 return MagicMock(stdout=dwarf_out, returncode=0)
             if cmd[0] == self.cli_path:
+                # Option-C: parseDSYM now prefers `bugsee-cli dsym
+                # uuid`. Extract the UUID from the canned dwarf_out
+                # so the CLI path produces the SAME UUIDs the
+                # dwarfdump fallback would. cli_calls counts ONLY
+                # the debug-files upload invocations.
+                if len(cmd) >= 3 and cmd[1] == "dsym" and cmd[2] == "uuid":
+                    import json as _json
+                    m = re.search(r'UUID:\s+([0-9A-Fa-f-]+)', dwarf_out)
+                    return MagicMock(
+                        stdout=_json.dumps([m.group(1)] if m else []),
+                        returncode=0,
+                    )
                 cli_calls.append(list(cmd))
                 return MagicMock(returncode=0)
             raise AssertionError("unexpected: %r" % cmd)
