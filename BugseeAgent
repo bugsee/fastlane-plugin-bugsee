@@ -1320,8 +1320,24 @@ def _run_dependencies_pipeline(app_token, project_root):
     Failures here MUST NOT block the existing symbols-upload
     step — both pipelines are independent.
     """
-    entries, scope_label, truncated = _collect_all_dependencies(project_root)
-    timings_summary, timings_gz = resolve_build_timings(os.environ)
+    # Per-feature gating. Each side of the cross-producer
+    # handshake decides independently whether THIS agent should
+    # contribute deps / timings — see the --no-deps / --no-timings
+    # OptionParser entries. The fastlane Ruby action sets these
+    # flags based on the manifest the iOS SDK's BugseeAgent build
+    # phase emitted (or didn't) for this build.
+    collect_deps    = getattr(options, 'collect_deps',    True)
+    collect_timings = getattr(options, 'collect_timings', True)
+
+    if collect_deps:
+        entries, scope_label, truncated = _collect_all_dependencies(project_root)
+    else:
+        entries, scope_label, truncated = [], 'all', False
+
+    if collect_timings:
+        timings_summary, timings_gz = resolve_build_timings(os.environ)
+    else:
+        timings_summary, timings_gz = None, None
 
     have_deps    = bool(entries)
     have_timings = timings_summary is not None
@@ -2505,11 +2521,29 @@ if __name__ == "__main__":
     # the build with Bugsee and uploads a per-build deps blob
     # parsed from Podfile.lock / Package.resolved / Cartfile.resolved
     # / linked vendored frameworks. Disable with --no-deps if the
-    # consumer wants the legacy symbols-only flow.
+    # consumer wants the legacy symbols-only flow OR if the Bugsee
+    # iOS SDK's tools.bundle/BugseeAgent build phase already
+    # handled deps collection for this build (the fastlane Ruby
+    # action checks the cross-producer handshake and passes
+    # --no-deps when it detects the other producer did the work).
     parser.add_option("--no-deps", dest="collect_deps", action="store_false",
                   default=True,
-                  help="Skip the build registration + dependencies upload "
-                       "step. Symbols upload still runs as before.")
+                  help="Skip the dependencies collection + upload step. "
+                       "Symbols + timings uploads still run unless "
+                       "disabled separately.")
+    # Timings-collection toggle. On by default. Independent of
+    # --no-deps so the cross-producer handshake can disable each
+    # action individually. When the Bugsee iOS SDK's
+    # tools.bundle/BugseeAgent build phase already collected the
+    # xcactivitylog-derived build timings for this build, the
+    # fastlane Ruby action passes --no-timings here and the
+    # build-info pipeline emits no `build_metadata.timings`
+    # sub-object and skips the timings PUT.
+    parser.add_option("--no-timings", dest="collect_timings",
+                  action="store_false", default=True,
+                  help="Skip the xcactivitylog-derived build timings "
+                       "collection + upload step. Symbols + deps "
+                       "uploads still run unless disabled separately.")
     # bugsee-cli override knobs. See the resolver block near the top of
     # this file for the full precedence rules.
     parser.add_option("--cli-path", dest="cli_path",

@@ -1,4 +1,5 @@
 require 'fastlane/plugin/bugsee/helper/bugsee_uuid'
+require 'fastlane/plugin/bugsee/helper/bugsee_handshake'
 
 module Fastlane
   module Actions
@@ -69,6 +70,23 @@ module Fastlane
         if icon_path && !File.exist?(icon_path)
           UI.important("Bugsee: icon_path does not exist (#{icon_path}); proceeding without icon")
           icon_path = nil
+        end
+
+        # Cross-producer handshake: if the Bugsee Android Gradle
+        # plugin already uploaded this build's mapping, skip — the
+        # server would just dedupe by hash but the lane log gets
+        # noisy and CI pays for redundant bandwidth. The user can
+        # override with `force: true` for re-uploads / debugging.
+        unless params[:force]
+          manifest = Fastlane::Bugsee::Handshake.find_manifest(
+            search_root: Dir.pwd,
+            version_name: version,
+            version_code: build,
+          )
+          if Fastlane::Bugsee::Handshake.handled_by_other?(manifest, 'mapping_upload')
+            UI.important(Fastlane::Bugsee::Handshake.skip_message(manifest, 'mapping_upload'))
+            return
+          end
         end
 
         uuid = resolve_uuid(params, app_token, version, build)
@@ -220,6 +238,12 @@ module Fastlane
           FastlaneCore::ConfigItem.new(key: :cli_version,
                                        env_name: "BUGSEE_CLI_VERSION",
                                        description: "bugsee-cli version to auto-download",
+                                       optional: true),
+          FastlaneCore::ConfigItem.new(key: :force,
+                                       env_name: "BUGSEE_FORCE",
+                                       description: "Skip the cross-producer handshake check and always upload, even if the Bugsee Android Gradle plugin already handled this build's mapping",
+                                       is_string: false,
+                                       default_value: false,
                                        optional: true)
         ]
       end

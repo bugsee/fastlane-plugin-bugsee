@@ -474,6 +474,121 @@ describe Fastlane::Actions::UploadMappingToBugseeAction do
   end
 
   # ──────────────────────────────────────────────────────────────
+  # Cross-producer handshake
+  # ──────────────────────────────────────────────────────────────
+  describe '.run handshake gating' do
+    let(:now) { Time.now }
+
+    def handshake_manifest(actions, version: '1.0', build: '1')
+      {
+        'schema_version'   => 1,
+        'producer'         => 'bugsee-android-gradle-plugin',
+        'producer_version' => 'X.Y.Z',
+        'build_id'         => 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        'produced_at_ms'   => (now.to_f * 1000).to_i,
+        'version_name'     => version,
+        'version_code'     => build,
+        'actions'          => actions,
+      }
+    end
+
+    def write_handshake(dir, manifest)
+      sub = File.join(dir, 'app/build/intermediates/bugsee/release')
+      FileUtils.mkdir_p(sub)
+      File.write(File.join(sub, 'build-actions.json'), JSON.dump(manifest))
+    end
+
+    it 'skips the upload entirely when the manifest says mapping_upload is handled' do
+      Dir.mktmpdir do |dir|
+        write_handshake(dir, handshake_manifest({'mapping_upload' => true}))
+        Dir.chdir(dir) do
+          described_class.run(
+            app_token: 'tok',
+            mapping_path: tmp_mapping.path,
+            version: '1.0',
+            build: '1',
+            agent_path: agent_path,
+          )
+        end
+        # No shell call — the action returned before constructing
+        # the command.
+        expect(sh_capture).to eq([])
+      end
+    end
+
+    it 'proceeds with upload when the manifest says mapping_upload is false' do
+      Dir.mktmpdir do |dir|
+        write_handshake(dir,
+                        handshake_manifest({'mapping_upload' => false,
+                                            'deps_collection' => true}))
+        Dir.chdir(dir) do
+          described_class.run(
+            app_token: 'tok',
+            mapping_path: tmp_mapping.path,
+            version: '1.0',
+            build: '1',
+            agent_path: agent_path,
+          )
+        end
+        expect(sh_capture.size).to eq(1)
+        expect(sh_capture.first).to include('--upload-mapping')
+      end
+    end
+
+    it 'proceeds with upload when no manifest exists' do
+      Dir.mktmpdir do |dir|
+        Dir.chdir(dir) do
+          described_class.run(
+            app_token: 'tok',
+            mapping_path: tmp_mapping.path,
+            version: '1.0',
+            build: '1',
+            agent_path: agent_path,
+          )
+        end
+        expect(sh_capture.size).to eq(1)
+      end
+    end
+
+    it 'force: true bypasses the handshake and always uploads' do
+      Dir.mktmpdir do |dir|
+        write_handshake(dir, handshake_manifest({'mapping_upload' => true}))
+        Dir.chdir(dir) do
+          described_class.run(
+            app_token: 'tok',
+            mapping_path: tmp_mapping.path,
+            version: '1.0',
+            build: '1',
+            force: true,
+            agent_path: agent_path,
+          )
+        end
+        expect(sh_capture.size).to eq(1)
+      end
+    end
+
+    it 'ignores a manifest whose version_name does not match' do
+      # A handshake from a previous build at a different version
+      # MUST be treated as absent so the action does the work.
+      Dir.mktmpdir do |dir|
+        write_handshake(dir,
+                        handshake_manifest({'mapping_upload' => true},
+                                            version: '9.9.9'))
+        Dir.chdir(dir) do
+          described_class.run(
+            app_token: 'tok',
+            mapping_path: tmp_mapping.path,
+            version: '1.0',
+            build: '1',
+            agent_path: agent_path,
+          )
+        end
+        expect(sh_capture.size).to eq(1)
+      end
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────────
   # helpers
   # ──────────────────────────────────────────────────────────────
 

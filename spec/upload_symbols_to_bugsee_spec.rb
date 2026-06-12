@@ -266,13 +266,20 @@ describe Fastlane::Actions::UploadSymbolsToBugseeAction do
       end
     end
 
-    it 'skips the shell call entirely when dsym_paths is empty (no work to do)' do
+    it 'still invokes BugseeAgent when dsym_paths is empty (deps + timings still run)' do
+      # Behaviour change vs. pre-handshake: an empty dsym_paths
+      # used to skip BugseeAgent entirely. With deps + timings
+      # collection wired into the same pipeline, an invocation
+      # without dSYMs still needs to run them (unless the
+      # handshake says they're already handled — see the
+      # handshake test below).
       described_class.run(
         app_token: 'tok',
         dsym_paths: [],
         agent_path: agent_path,
       )
-      expect(sh_capture).to eq([])
+      expect(sh_capture.size).to eq(1)
+      expect(sh_capture.first).not_to match(/\.dSYM/)
     end
 
     # ─── Error handling ────────────────────────────────────────
@@ -309,6 +316,144 @@ describe Fastlane::Actions::UploadSymbolsToBugseeAction do
           agent_path: agent_path,
         )
       }.not_to raise_error
+    end
+  end
+
+  # ──────────────────────────────────────────────────────────────
+  # Cross-producer handshake
+  # ──────────────────────────────────────────────────────────────
+  describe '.run handshake gating' do
+    let(:now) { Time.now }
+
+    def handshake_manifest(actions, version: '1.0', build: '1')
+      {
+        'schema_version'   => 1,
+        'producer'         => 'bugsee-ios-sdk-tools-bundle',
+        'producer_version' => 'X.Y.Z',
+        'build_id'         => 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+        'produced_at_ms'   => (now.to_f * 1000).to_i,
+        'version_name'     => version,
+        'version_code'     => build,
+        'actions'          => actions,
+      }
+    end
+
+    def write_handshake(dir, manifest)
+      sub = File.join(dir, 'MyApp/build/bugsee')
+      require 'fileutils'
+      FileUtils.mkdir_p(sub)
+      require 'json'
+      File.write(File.join(sub, 'build-actions.json'), JSON.dump(manifest))
+    end
+
+    it 'skips BugseeAgent entirely when all three actions are handled' do
+      Dir.mktmpdir do |dir|
+        write_handshake(dir, handshake_manifest({
+          'dsym_upload'     => true,
+          'deps_collection' => true,
+          'timings'         => true,
+        }))
+        Dir.chdir(dir) do
+          described_class.run(
+            app_token: 'tok',
+            dsym_paths: [tmp_dsym.path],
+            version: '1.0',
+            build: '1',
+            agent_path: agent_path,
+          )
+        end
+        expect(sh_capture).to eq([])
+      end
+    end
+
+    it 'passes --no-deps when only deps_collection is handled' do
+      Dir.mktmpdir do |dir|
+        write_handshake(dir, handshake_manifest({
+          'dsym_upload'     => false,
+          'deps_collection' => true,
+          'timings'         => false,
+        }))
+        Dir.chdir(dir) do
+          described_class.run(
+            app_token: 'tok',
+            dsym_paths: [tmp_dsym.path],
+            version: '1.0',
+            build: '1',
+            agent_path: agent_path,
+          )
+        end
+        expect(sh_capture.size).to eq(1)
+        expect(sh_capture.first).to include('--no-deps')
+        expect(sh_capture.first).not_to include('--no-timings')
+        expect(sh_capture.first).to include(tmp_dsym.path)
+      end
+    end
+
+    it 'passes --no-timings when only timings is handled' do
+      Dir.mktmpdir do |dir|
+        write_handshake(dir, handshake_manifest({
+          'dsym_upload'     => false,
+          'deps_collection' => false,
+          'timings'         => true,
+        }))
+        Dir.chdir(dir) do
+          described_class.run(
+            app_token: 'tok',
+            dsym_paths: [tmp_dsym.path],
+            version: '1.0',
+            build: '1',
+            agent_path: agent_path,
+          )
+        end
+        expect(sh_capture.size).to eq(1)
+        expect(sh_capture.first).to include('--no-timings')
+        expect(sh_capture.first).not_to include('--no-deps')
+      end
+    end
+
+    it 'strips dSYM paths when only dsym_upload is handled' do
+      Dir.mktmpdir do |dir|
+        write_handshake(dir, handshake_manifest({
+          'dsym_upload'     => true,
+          'deps_collection' => false,
+          'timings'         => false,
+        }))
+        Dir.chdir(dir) do
+          described_class.run(
+            app_token: 'tok',
+            dsym_paths: [tmp_dsym.path],
+            version: '1.0',
+            build: '1',
+            agent_path: agent_path,
+          )
+        end
+        expect(sh_capture.size).to eq(1)
+        expect(sh_capture.first).not_to include(tmp_dsym.path)
+      end
+    end
+
+    it 'force: true bypasses the handshake and runs everything' do
+      Dir.mktmpdir do |dir|
+        write_handshake(dir, handshake_manifest({
+          'dsym_upload'     => true,
+          'deps_collection' => true,
+          'timings'         => true,
+        }))
+        Dir.chdir(dir) do
+          described_class.run(
+            app_token: 'tok',
+            dsym_paths: [tmp_dsym.path],
+            version: '1.0',
+            build: '1',
+            force: true,
+            agent_path: agent_path,
+          )
+        end
+        expect(sh_capture.size).to eq(1)
+        expect(sh_capture.first).not_to include('--no-deps')
+        expect(sh_capture.first).not_to include('--no-timings')
+        expect(sh_capture.first).to include(tmp_dsym.path)
+      end
     end
   end
 

@@ -142,6 +142,74 @@ SDK side, which has been parsing them in production for many
 releases). The pieces tested above are the iOS-platform-specific
 bits that don't depend on the binary format.
 
+### Cross-producer handshake — per-action de-duplication
+
+When more than one Bugsee producer can run on the same build —
+typically the Bugsee Android Gradle plugin OR the Bugsee iOS
+SDK's `tools.bundle/BugseeAgent` build phase running alongside
+this fastlane plugin — only ONE producer should handle each
+action (mapping upload, dSYM upload, deps collection, build
+timings, size analysis). Otherwise the same payload reaches the
+server twice; the server dedupes by hash so it's not broken,
+but the lane log gets noisy and the customer pays for redundant
+bandwidth.
+
+This release adds a runtime handshake protocol. Each producer
+that ran writes a small JSON manifest declaring which actions
+it handled:
+
+  - **Bugsee Android Gradle plugin** writes
+    `<project>/**/build/intermediates/bugsee/<variant>/build-actions.json`.
+  - **Bugsee iOS SDK `tools.bundle/BugseeAgent`** writes
+    `<srcroot>/build/bugsee/build-actions.json`.
+
+(Producer-side writers ship in separate releases of those
+projects; the fastlane plugin reads what they produce.)
+
+The fastlane actions read the most recent matching manifest on
+every invocation and skip per-action work that was already done.
+Build-identity matching (`version_name` / `version_code`)
+filters stale manifests from previous builds; the staleness
+window is one hour.
+
+`Fastlane::Bugsee::Uuid` was joined by
+`Fastlane::Bugsee::Handshake` — a standalone helper module
+(zero fastlane dependencies; testable in isolation) that owns
+the manifest schema, location glob, staleness window, and
+identity match.
+
+Both existing actions gained the wiring:
+
+  - `upload_symbols_to_bugsee` checks `dsym_upload`,
+    `deps_collection`, and `timings` independently. When some
+    are handled by the other producer, only the missing ones
+    run via BugseeAgent (`--no-deps` / `--no-timings` flags
+    forwarded). When all three are handled, BugseeAgent is not
+    invoked at all.
+  - `upload_mapping_to_bugsee` checks `mapping_upload`. When
+    handled, the action returns immediately without invoking
+    BugseeAgent or the CLI.
+
+Each action takes a new `:force` ConfigItem (env
+`BUGSEE_FORCE`, default `false`) that skips the handshake
+check. Useful for re-uploads or debugging.
+
+BugseeAgent gained the `--no-timings` flag (parallel to the
+existing `--no-deps`) and the build-info pipeline now gates deps
+and timings independently. A producer that wants only timings
+or only deps can disable the other side cleanly.
+
+### Behaviour change
+
+`upload_symbols_to_bugsee` previously short-circuited when
+`dsym_paths` was empty. With deps + timings collection wired
+into the same pipeline (1.1.0 already), the action now also
+runs deps + timings collection independently of dSYM presence —
+unless the handshake says they're already handled. The shell
+call is skipped entirely only when ALL three actions are
+handled by another producer, or when `dsym_paths` is empty AND
+the action has no other work to do.
+
 ### Fixed
 
 - `upload_symbols_to_bugsee`'s `symbol_maps:` parameter is now
