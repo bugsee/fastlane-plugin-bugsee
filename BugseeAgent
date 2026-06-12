@@ -187,6 +187,38 @@ def uploadDsymViaCli(cliBinary, dsymPath, appToken, endpoint, version, build):
         return False
 
 
+def uploadMappingViaCli(cliBinary, mappingPath, appToken, endpoint,
+                        version, build, uuid, iconPath=None):
+    """Exec bugsee-cli to upload one ProGuard / R8 mapping.txt for
+    Android. The fastlane-plugin-bugsee `upload_mapping_to_bugsee`
+    action resolves the UUID Ruby-side (either from the Bugsee Gradle
+    plugin's BugseeBuildIdResolveTask output, or by Ruby-side
+    synthesis matching the SDK's runtime fallback formula) and
+    passes it via `uuid`. The CLI's local UUID compute is bypassed.
+
+    Returns True on success.
+    """
+    cmd = [
+        cliBinary,
+        "--endpoint", endpoint,
+        "--app-token", appToken,
+        "debug-files", "upload",
+        "--type", "proguard",
+        "--version", version or "",
+        "--build", build or "",
+        "--uuid", uuid or "",
+    ]
+    if iconPath:
+        cmd.extend(["--icon", iconPath])
+    cmd.append(mappingPath)
+    try:
+        result = subprocess.run(cmd, check=False)
+        return result.returncode == 0
+    except Exception as e:
+        print("Bugsee: failed to exec bugsee-cli at %s: %s" % (cliBinary, e))
+        return False
+
+
 # ──────────────────────────────────────────────────────────────────
 # Build dependencies collection (parallel to the Android Gradle
 # plugin's `DependencyCollector` — wire format must stay in lockstep
@@ -1586,6 +1618,42 @@ if __name__ == "__main__":
                        "(Podfile.lock / Package.resolved / Cartfile.resolved) "
                        "are searched for. Defaults to $SRCROOT then "
                        "$PROJECT_DIR when run from Xcode.")
+    # ──────────────────────────────────────────────
+    # Android mapping upload mode (off by default)
+    # ──────────────────────────────────────────────
+    # When --upload-mapping is passed, BugseeAgent skips ALL the
+    # iOS-side flows (dSYM upload, dependencies pipeline,
+    # daemonization, dSYM-folder scanning) and runs ONE step:
+    # resolve bugsee-cli, upload the mapping.txt at --mapping-path
+    # via `debug-files upload --type proguard --uuid <pre-resolved>`.
+    # The fastlane plugin's upload_mapping_to_bugsee Ruby action
+    # resolves the UUID upstream (from explicit override, the Bugsee
+    # Gradle plugin's build-uuid.txt, or synthesis matching the
+    # SDK's runtime fallback formula) and passes the pre-resolved
+    # value via --mapping-uuid.
+    parser.add_option("--upload-mapping", dest="upload_mapping",
+                  action="store_true", default=False,
+                  help="Run in Android mapping upload mode. Skips "
+                       "iOS dSYM / deps flows entirely. Requires "
+                       "--mapping-path, --mapping-uuid, --version, "
+                       "--build, and the positional app token.")
+    parser.add_option("--mapping-path", dest="mapping_path",
+                  default=None,
+                  help="Path to the Android mapping.txt to upload. "
+                       "Only used with --upload-mapping.")
+    parser.add_option("--mapping-uuid", dest="mapping_uuid",
+                  default=None,
+                  help="Pre-resolved BUILD_UUID for the mapping. "
+                       "The fastlane action computes this Ruby-side "
+                       "(from the Gradle plugin's build-uuid.txt or "
+                       "by synthesis matching the SDK's runtime "
+                       "fallback formula) so the SDK can match the "
+                       "uploaded mapping against runtime crashes.")
+    parser.add_option("--icon", dest="icon_path",
+                  default=None,
+                  help="Optional launcher-icon PNG path. Forwarded "
+                       "to bugsee-cli's --icon flag for "
+                       "--type proguard uploads.")
     (options, args) = parser.parse_args()
 
     # ──────────────────────────────────────────────
@@ -1598,6 +1666,54 @@ if __name__ == "__main__":
         print("Bugsee:  Not initialized with app token. Must be passed as a parameter")
         exit(1)
     APP_TOKEN = args[0]
+
+    # ──────────────────────────────────────────────
+    # Android mapping upload — short-circuit path
+    # ──────────────────────────────────────────────
+    # Runs BEFORE the from_xcode daemonization fork so the
+    # mapping upload is fully synchronous from the caller's
+    # perspective (the Ruby action's Actions.sh shells to us and
+    # blocks on completion). Skips:
+    #   - the iOS dSYM upload flow (--type dsym is wrong for Android)
+    #   - the iOS deps pipeline (Podfile.lock / Package.resolved /
+    #     Cartfile.resolved scanning — irrelevant for an Android
+    #     build's mapping.txt)
+    #   - the daemonization double-fork (the iOS-specific Xcode-
+    #     post-action runs out-of-process so it can't block the
+    #     build; the fastlane Android lane WANTS to block).
+    # The fastlane action's Ruby side handles UUID resolution and
+    # input validation; here we just exec the CLI.
+    if options.upload_mapping:
+        if not options.mapping_path:
+            print("Bugsee: --upload-mapping requires --mapping-path")
+            exit(1)
+        if not options.mapping_uuid:
+            print("Bugsee: --upload-mapping requires --mapping-uuid "
+                  "(fastlane-resolved BUILD_UUID for SDK matching)")
+            exit(1)
+        if not os.path.isfile(options.mapping_path):
+            print("Bugsee: mapping file does not exist: %s"
+                  % options.mapping_path)
+            exit(1)
+        if options.icon_path and not os.path.isfile(options.icon_path):
+            print("Bugsee: --icon path does not exist: %s "
+                  "(continuing without icon)" % options.icon_path)
+            options.icon_path = None
+        cliBinary = resolveCli(options.cli_path, options.cli_version)
+        if not cliBinary:
+            print("Bugsee: bugsee-cli unavailable; mapping upload skipped")
+            exit(1)
+        ok = uploadMappingViaCli(
+            cliBinary, options.mapping_path, APP_TOKEN,
+            options.endpoint, options.version, options.build,
+            options.mapping_uuid, options.icon_path,
+        )
+        if ok:
+            print("Bugsee: mapping uploaded successfully")
+            exit(0)
+        else:
+            print("Bugsee: mapping upload failed")
+            exit(1)
 
     if options.from_xcode:
         # do the UNIX double-fork magic, see Stevens' "Advanced

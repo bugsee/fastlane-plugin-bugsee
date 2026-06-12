@@ -121,21 +121,59 @@ the contract.
   (`POST /v2/apps/<token>/builds`) is the planned path back —
   tracked separately from this release.
 
-### Scope clarification: Android mapping upload
+### Android mapping upload — `upload_mapping_to_bugsee`
 
-The plugin remains iOS-only by design. Android mapping (ProGuard /
-R8) upload stays with the
-[Bugsee Android Gradle plugin](https://github.com/bugsee/bugsee-android-gradle-plugin),
-not a parallel fastlane action — because the Bugsee Android SDK
-learns the build UUID from channels only the Gradle plugin can
-populate (post-R8 asset file + manifest meta-data fallback). A
-fastlane-only mapping upload would land on the server but the SDK's
-crash reports would carry no matching UUID, so symbolication would
-never resolve.
+New action covering two specific scenarios where the Bugsee Android
+Gradle plugin alone isn't sufficient:
 
-A README section now points searchers in that direction so they
-don't bounce off the plugin assuming Android isn't supported by
-Bugsee at all.
+1. **Split build / publish CI.** The build stage runs gradle on
+   machine A without the Bugsee app token; the publish stage runs
+   fastlane on machine B with the production token and uploads the
+   mapping. The action reads the Gradle plugin's
+   `build-uuid.txt` (auto-globbed under
+   `**/build/intermediates/bugsee/*/build-uuid.txt`) so the
+   uploaded mapping is keyed by the same UUID the SDK already has
+   baked into the APK.
+2. **No Gradle plugin in the loop**, paired with Bugsee Android
+   SDK 7.0.0-beta13+. The action synthesises a UUID Ruby-side via
+   `UUID.nameUUIDFromBytes(app_token + 0x1F + version + 0x1F + build)`;
+   the SDK reproduces the same UUID at runtime via its third
+   BUILD_UUID fallback (Channel 3, added in 7.0.0-beta13).
+
+The canonical case (Gradle plugin already in the loop, doing the
+upload) remains untouched — this action complements rather than
+replaces it.
+
+UUID resolution chain: explicit `:uuid` > `:build_uuid_path` (if
+the file exists) > globbed Gradle plugin `build-uuid.txt` > Ruby-side
+synthesis matching the SDK Channel 3 formula. All four branches
+produce a UUID the SDK can reproduce at runtime.
+
+Wire-format implementation: the Ruby action shells to
+`BugseeAgent --upload-mapping` (Python), which shells to
+`bugsee-cli debug-files upload --type proguard --uuid <resolved>`.
+The mapping upload reuses the same `bugsee-cli` resolver, cache
+layout (`~/.bugsee/cli/<version>/<triple>/`), and SHA-256 verified
+auto-download that powers the existing iOS dSYM path. No new CLI
+dependency.
+
+The Ruby-side UUID synthesis lives in
+`Fastlane::Bugsee::Uuid.name_uuid_from_bytes` — a standalone helper
+that mirrors Java's `UUID.nameUUIDFromBytes(bytes)` byte-for-byte
+(MD5, version-3 + RFC-4122 variant bit twiddles). Cross-language
+parity is locked in via a pinned reference vector in
+`spec/bugsee_uuid_spec.rb` (Ruby), the Android SDK's
+`BugseeEnvironmentBuildIdReaderTest.channel3_synthesisFormula_pinnedReferenceVector`
+(Java), and the existing bugsee-cli `nameUUIDFromBytes` parity test
+(Rust) — same input bytes, same expected UUID across all three.
+
+`is_supported?(:android)` only; the existing
+`upload_symbols_to_bugsee` remains `is_supported?(:ios)` only.
+
+Test surface: +8 Python unittests in `TestUploadMappingViaCli`,
++47 RSpec examples across `spec/bugsee_uuid_spec.rb` and
+`spec/upload_mapping_to_bugsee_spec.rb`. Combined suite: 140
+Python + 79 RSpec = 219 tests, sub-200ms wall.
 
 ## 1.0.4
 

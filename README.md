@@ -68,16 +68,40 @@ The emitted blob is wire-compatible with the Bugsee Android Gradle plugin's `Dep
 
 No configuration is required — if a lockfile exists, it's collected.
 
-## Android symbols / mapping files
+## Android mapping (ProGuard / R8) upload
 
-This plugin is **iOS-only**. Android mapping (ProGuard / R8) upload is handled by the [Bugsee Android Gradle plugin](https://github.com/bugsee/bugsee-android-gradle-plugin), not by a fastlane action.
+Starting with `1.1.0`, this plugin also supports uploading Android `mapping.txt` files via a separate `upload_mapping_to_bugsee` action. The canonical path remains the [Bugsee Android Gradle plugin](https://github.com/bugsee/bugsee-android-gradle-plugin), which does the upload automatically as part of every gradle build. Reach for this fastlane action only when one of the following applies:
 
-The Gradle plugin is the canonical path for two reasons:
+- **Your CI splits build (no token) from publish (production token).** The Gradle plugin builds the APK on machine A without uploading; this action uploads the mapping on machine B with the production token. The action looks for the Gradle plugin's `build-uuid.txt` (under `**/build/intermediates/bugsee/*/build-uuid.txt`) so the UUID matches what the SDK already has baked into the APK.
+- **The host app is not instrumented by the Bugsee Gradle plugin** — *and* uses Bugsee Android SDK 7.0.0-beta13+. The action synthesises a UUID Ruby-side from `(app_token, version, build)`; the SDK reproduces the same UUID at runtime via its third BUILD_UUID fallback (added in 7.0.0-beta13), so symbolication still works.
 
-1. **The Bugsee Android SDK reads the build UUID from channels only the Gradle plugin can populate** — an asset file injected post-R8, and a manifest meta-data fallback. By the time fastlane runs, the APK is already built and signed; neither channel can be written retroactively. A fastlane-only upload would land on the server but the SDK's crash reports would carry no matching UUID, and symbolication would never resolve.
-2. **The Gradle plugin already shells out to `bugsee-cli`** for the actual upload — the same Rust binary this fastlane plugin uses for iOS dSYMs. One upload mechanism, one wire format across both platforms.
+If neither applies — i.e. you're using the Gradle plugin in the standard way — there's nothing to do; the Gradle plugin handles the upload as part of the existing `gradle` action.
 
-If you're using `fastlane` for Android release orchestration (`gradle`, `supply`, etc.), add the Bugsee Android Gradle plugin to your `build.gradle.kts` and let the standard `bugseeMappingUpload<Variant>` task run as part of your gradle build — fastlane invokes it for free as part of the existing `gradle` action.
+Example invocation:
+
+```ruby
+upload_mapping_to_bugsee(
+  app_token:    ENV["BUGSEE_APP_TOKEN"],
+  mapping_path: "./app/build/outputs/mapping/release/mapping.txt",
+  version:      "1.2.3",   # android:versionName
+  build:        "42",      # android:versionCode
+  # Optional:
+  # uuid:            "...",  # explicit override
+  # build_uuid_path: "app/build/intermediates/bugsee/release/build-uuid.txt",
+  # icon_path:       "app/src/main/res/mipmap-xxxhdpi/ic_launcher.png",
+)
+```
+
+**UUID resolution chain** (most authoritative to fallback):
+
+1. Explicit `:uuid` if passed.
+2. `:build_uuid_path` if given and the file exists.
+3. The Bugsee Gradle plugin's `build-uuid.txt`, auto-globbed under `**/build/intermediates/bugsee/*/build-uuid.txt`.
+4. Ruby-side synthesis: `nameUUIDFromBytes(app_token + 0x1F + version + 0x1F + build)` — matches the SDK's Channel 3 runtime fallback (7.0.0-beta13+).
+
+All four branches produce a UUID the SDK can independently reproduce, so server-side mapping lookup resolves crashes correctly regardless of which branch fired.
+
+The action `is_supported?(:android)` only.
 
 ## Documentation
 

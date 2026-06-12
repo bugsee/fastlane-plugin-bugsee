@@ -422,6 +422,129 @@ class TestUploadDsymViaCli(unittest.TestCase):
 
 
 # ──────────────────────────────────────────────────────────────────
+# uploadMappingViaCli — Android ProGuard / R8 mapping.txt upload
+# via `bugsee-cli debug-files upload --type proguard`. Argv shape
+# matches what the Android Gradle plugin's MappingUploadTask
+# produces — the fastlane Ruby action resolves the UUID upstream and
+# we just pass it through.
+# ──────────────────────────────────────────────────────────────────
+class TestUploadMappingViaCli(unittest.TestCase):
+    def test_argv_shape_pinned_no_icon(self):
+        # All flags in deterministic order so a regression in the
+        # CLI's option ordering or our argv builder fails this test
+        # clearly. The order matches CliUploader.kt's
+        # buildMappingArgv — that's the cross-repo wire contract.
+        with patch.object(agent.subprocess, "run",
+                          return_value=MagicMock(returncode=0)) as mock_run:
+            ok = agent.uploadMappingViaCli(
+                "/path/to/bugsee-cli", "/path/to/mapping.txt",
+                "app-tok", "https://api.bugsee.com",
+                "1.2.3", "42", "the-uuid",
+            )
+            self.assertTrue(ok)
+            argv = mock_run.call_args[0][0]
+            self.assertEqual(argv, [
+                "/path/to/bugsee-cli",
+                "--endpoint", "https://api.bugsee.com",
+                "--app-token", "app-tok",
+                "debug-files", "upload",
+                "--type", "proguard",
+                "--version", "1.2.3",
+                "--build", "42",
+                "--uuid", "the-uuid",
+                "/path/to/mapping.txt",
+            ])
+
+    def test_argv_includes_icon_flag_when_provided(self):
+        with patch.object(agent.subprocess, "run",
+                          return_value=MagicMock(returncode=0)) as mock_run:
+            agent.uploadMappingViaCli(
+                "/cli", "/mapping.txt", "tok", "ep",
+                "1.0", "1", "uuid-x", "/icon.png",
+            )
+            argv = mock_run.call_args[0][0]
+            self.assertIn("--icon", argv)
+            icon_idx = argv.index("--icon")
+            self.assertEqual(argv[icon_idx + 1], "/icon.png")
+            # Mapping path remains the LAST positional after --icon
+            # so the CLI's argparse treats it as the path arg, not
+            # the icon arg.
+            self.assertEqual(argv[-1], "/mapping.txt")
+
+    def test_argv_omits_icon_flag_when_none(self):
+        with patch.object(agent.subprocess, "run",
+                          return_value=MagicMock(returncode=0)) as mock_run:
+            agent.uploadMappingViaCli(
+                "/cli", "/mapping.txt", "tok", "ep",
+                "1.0", "1", "uuid-x", None,
+            )
+            argv = mock_run.call_args[0][0]
+            self.assertNotIn("--icon", argv)
+
+    def test_argv_omits_icon_flag_when_empty_string(self):
+        # Defensive: passing an empty string should also drop the
+        # flag (the Ruby action coerces missing-but-given to nil
+        # before invoking BugseeAgent; pin the agent-side defense too).
+        with patch.object(agent.subprocess, "run",
+                          return_value=MagicMock(returncode=0)) as mock_run:
+            agent.uploadMappingViaCli(
+                "/cli", "/mapping.txt", "tok", "ep",
+                "1.0", "1", "uuid-x", "",
+            )
+            argv = mock_run.call_args[0][0]
+            self.assertNotIn("--icon", argv)
+
+    def test_returns_false_on_nonzero_exit(self):
+        # CLI exit non-zero must surface as False so the Ruby
+        # action's caller can react (the action itself swallows the
+        # failure via UI.error to keep the lane running).
+        with patch.object(agent.subprocess, "run",
+                          return_value=MagicMock(returncode=1)):
+            self.assertFalse(agent.uploadMappingViaCli(
+                "/cli", "/mapping", "t", "e", "v", "b", "u",
+            ))
+
+    def test_returns_false_on_subprocess_exception(self):
+        # ENOEXEC / FileNotFoundError on a broken or missing CLI
+        # binary must surface as False (and log) rather than
+        # bubbling up.
+        with patch.object(agent.subprocess, "run",
+                          side_effect=OSError("ENOEXEC")):
+            self.assertFalse(agent.uploadMappingViaCli(
+                "/cli", "/mapping", "t", "e", "v", "b", "u",
+            ))
+
+    def test_none_version_and_build_pass_empty_string(self):
+        # Same defensive behaviour as the dSYM upload variant: empty
+        # string downstream rather than literal "None".
+        with patch.object(agent.subprocess, "run",
+                          return_value=MagicMock(returncode=0)) as mock_run:
+            agent.uploadMappingViaCli(
+                "/cli", "/mapping", "t", "e", None, None, "u",
+            )
+            argv = mock_run.call_args[0][0]
+            v_idx = argv.index("--version")
+            b_idx = argv.index("--build")
+            self.assertEqual(argv[v_idx + 1], "")
+            self.assertEqual(argv[b_idx + 1], "")
+
+    def test_none_uuid_passes_empty_string(self):
+        # The Ruby action ALWAYS resolves UUID upstream (explicit /
+        # file / synthesis), but if the agent ever runs with a None
+        # UUID for any reason, pass "" so the CLI's UUID parse
+        # surfaces an explicit error rather than crashing inside
+        # urllib's str-encoding of None.
+        with patch.object(agent.subprocess, "run",
+                          return_value=MagicMock(returncode=0)) as mock_run:
+            agent.uploadMappingViaCli(
+                "/cli", "/mapping", "t", "e", "v", "b", None,
+            )
+            argv = mock_run.call_args[0][0]
+            u_idx = argv.index("--uuid")
+            self.assertEqual(argv[u_idx + 1], "")
+
+
+# ──────────────────────────────────────────────────────────────────
 # parseDSYM — UUID extraction from dwarfdump output. Real dwarfdump
 # is mocked so tests are macOS/Linux portable.
 # ──────────────────────────────────────────────────────────────────
