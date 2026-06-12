@@ -1676,5 +1676,235 @@ class TestCollectBuildMetadataVcsWiring(unittest.TestCase):
                          '16.2.0')
 
 
+# ──────────────────────────────────────────────
+# Build timings (xcactivitylog)
+# ──────────────────────────────────────────────
+#
+# Ported from the iOS SDK's BugseeAgent. The full SLF tokenizer +
+# section extractor is exercised end-to-end by feeding real
+# xcactivitylog files through resolve_build_timings during
+# integration testing; here we cover the units that are easy to
+# fixture without a real Xcode log:
+#
+#   - _classify_section_title — the title-pattern table that maps
+#     Xcode build-section names to (managed_code / native /
+#     resources / packaging / other) categories.
+#   - resolve_build_timings soft-fail paths — empty env / missing
+#     OBJROOT / no log directory must degrade to (None, None)
+#     rather than raising, since a timings failure must not break
+#     the parent pipeline.
+#   - _find_derived_data_root / _find_latest_xcactivitylog —
+#     filesystem walk over a fake DerivedData layout.
+
+
+class TestClassifySectionTitle(unittest.TestCase):
+    """Pins the iOS-side category-classification rules. The
+    output ({managed_code, native, resources, packaging, other,
+    None}) drives the wire-format category_sums block — drift
+    here would silently re-bucket every iOS build's timings on the
+    dashboard."""
+
+    # NB: the classifier expects raw Xcode section titles. The
+    # function returns the category string OR None for sections
+    # that should NOT contribute to any category (typically wrapper
+    # / container sections that would otherwise double-count).
+    def _classify(self, title):
+        return agent._classify_section_title(title)
+
+    def test_swift_compile_classified_as_native(self):
+        # Per-source Swift compile event — the dominant unit on
+        # most iOS builds. Drift to anything else would re-bucket
+        # the largest chunk of every build's timings.
+        self.assertEqual(self._classify("Compile Foo.swift (arm64)"),
+                         "native")
+
+    def test_objc_compile_classified_as_native(self):
+        # Obj-C remains relevant on bridging-header projects and
+        # legacy targets. Same bucket as Swift since both produce
+        # native code.
+        self.assertEqual(self._classify("Compile Bar.m (arm64)"),
+                         "native")
+
+    def test_compile_swift_sources_phase_classified_as_native(self):
+        # Aggregate phase name from `swiftc`'s build plan.
+        self.assertEqual(self._classify("CompileSwiftSources"),
+                         "native")
+
+    def test_compile_clang_module_classified_as_native(self):
+        # Cross-cuts the `^Compiling ` generic wrapper-skip rule
+        # — pinned in the SDK's source as a precedence carve-out.
+        # If the carve-out is removed, this falls through to None
+        # and the dashboard loses Clang-module compile time.
+        self.assertEqual(self._classify("Compiling Clang module Foundation"),
+                         "native")
+
+    def test_asset_catalog_classified_as_resources(self):
+        self.assertEqual(self._classify("CompileAssetCatalog"),
+                         "resources")
+
+    def test_storyboard_classified_as_resources(self):
+        self.assertEqual(self._classify("CompileStoryboard"),
+                         "resources")
+
+    def test_info_plist_processing_classified_as_resources(self):
+        # Plist processing is bucketed with other "build inputs"
+        # not with linking/packaging.
+        self.assertEqual(self._classify("ProcessInfoPlistFile"),
+                         "resources")
+
+    def test_link_storyboards_classified_as_resources(self):
+        # PRECEDENCE PIN: `LinkStoryboards` MUST be classified as
+        # resources, not packaging. The packaging tuple has a
+        # generic `^Link\b` rule that would otherwise claim it.
+        # The classifier checks native → resources → packaging in
+        # order — a reordering of those three groups would cause
+        # this test to fail clearly rather than silently
+        # mis-bucketing storyboard linking.
+        self.assertEqual(self._classify("LinkStoryboards"),
+                         "resources")
+
+    def test_link_binary_classified_as_packaging(self):
+        # The actual `Link MyApp.app/MyApp normal arm64` step.
+        self.assertEqual(self._classify("Link Foo.app/Foo normal arm64"),
+                         "packaging")
+
+    def test_codesign_classified_as_packaging(self):
+        self.assertEqual(self._classify("CodeSign Foo.app"),
+                         "packaging")
+
+    def test_dsym_generation_classified_as_packaging(self):
+        self.assertEqual(self._classify("GenerateDSYMFile"),
+                         "packaging")
+
+    def test_swift_stdlib_embed_classified_as_packaging(self):
+        # Embedding the Swift runtime dylibs into the app bundle
+        # is conceptually packaging, not compilation. A regression
+        # that moved this back to `native` would skew "where did
+        # the time go" reporting.
+        self.assertEqual(self._classify("Copy Swift standard libraries"),
+                         "packaging")
+
+
+class TestResolveBuildTimingsSoftFail(unittest.TestCase):
+    """The pipeline expects (None, None) when timings are
+    unavailable — not an exception. Pin the soft-fail contract on
+    the common "nothing to find" paths."""
+
+    def test_empty_env_returns_none_none(self):
+        # Pristine env, no OBJROOT — the whole pipeline must
+        # degrade silently rather than raising.
+        summary, gz = agent.resolve_build_timings({})
+        self.assertIsNone(summary)
+        self.assertIsNone(gz)
+
+    def test_objroot_pointing_at_nonexistent_dir_returns_none(self):
+        summary, gz = agent.resolve_build_timings(
+            {'OBJROOT': '/no/such/derived/data'}
+        )
+        self.assertIsNone(summary)
+        self.assertIsNone(gz)
+
+    def test_objroot_with_no_logs_dir_returns_none(self):
+        with tempfile.TemporaryDirectory() as root:
+            # Realistic OBJROOT shape but missing the Logs/Build
+            # subdirectory — the walk-up finds nothing.
+            objroot = os.path.join(root, 'Build', 'Intermediates.noindex')
+            os.makedirs(objroot)
+            summary, gz = agent.resolve_build_timings({'OBJROOT': objroot})
+            self.assertIsNone(summary)
+            self.assertIsNone(gz)
+
+
+class TestFindDerivedDataRoot(unittest.TestCase):
+    """The walk-up locates the Xcode DerivedData root from any
+    descendant under it. Pins the boundary conditions (max steps,
+    no-match, top-down match)."""
+
+    def test_returns_none_for_empty_arg(self):
+        self.assertIsNone(agent._find_derived_data_root(None))
+        self.assertIsNone(agent._find_derived_data_root(""))
+
+    def test_walks_up_to_logs_build(self):
+        with tempfile.TemporaryDirectory() as dd_root:
+            # Construct a realistic DerivedData/Build/Intermediates/
+            # ArchiveIntermediates layout.
+            os.makedirs(os.path.join(dd_root, 'Logs', 'Build'))
+            deep_obj_root = os.path.join(
+                dd_root, 'Build', 'Intermediates.noindex',
+                'ArchiveIntermediates', 'MyScheme',
+                'IntermediateBuildFilesPath',
+            )
+            os.makedirs(deep_obj_root)
+
+            found = agent._find_derived_data_root(deep_obj_root)
+            # realpath both sides — macOS /tmp ↔ /private/tmp symlink
+            # would otherwise make this test fail on the host but
+            # pass in CI containers.
+            self.assertEqual(os.path.realpath(found),
+                             os.path.realpath(dd_root))
+
+    def test_returns_none_when_logs_build_not_found_within_cap(self):
+        # Construct a tree deeper than the 10-step cap; the walk
+        # MUST stop and return None rather than continue to /.
+        with tempfile.TemporaryDirectory() as root:
+            deep = root
+            for _ in range(12):
+                deep = os.path.join(deep, 'x')
+            os.makedirs(deep)
+            # No Logs/Build anywhere in the chain.
+            self.assertIsNone(agent._find_derived_data_root(deep))
+
+
+class TestFindLatestXcactivitylog(unittest.TestCase):
+    """The picker takes the newest-mtime log file; pin the tie-
+    break behaviour on equal mtimes (descending filename)."""
+
+    def test_returns_none_when_no_logs(self):
+        with tempfile.TemporaryDirectory() as dd_root:
+            os.makedirs(os.path.join(dd_root, 'Logs', 'Build'))
+            objroot = os.path.join(dd_root, 'Build', 'Intermediates.noindex')
+            os.makedirs(objroot)
+            self.assertIsNone(agent._find_latest_xcactivitylog(objroot))
+
+    def test_returns_newest_log_by_mtime(self):
+        import time as _t
+        with tempfile.TemporaryDirectory() as dd_root:
+            logs = os.path.join(dd_root, 'Logs', 'Build')
+            os.makedirs(logs)
+            old = os.path.join(logs, 'AAAA.xcactivitylog')
+            new = os.path.join(logs, 'BBBB.xcactivitylog')
+            open(old, 'wb').close()
+            _t.sleep(0.05)
+            open(new, 'wb').close()
+            objroot = os.path.join(dd_root, 'Build', 'Intermediates.noindex')
+            os.makedirs(objroot)
+
+            picked = agent._find_latest_xcactivitylog(objroot)
+            self.assertEqual(os.path.realpath(picked),
+                             os.path.realpath(new))
+
+    def test_tie_break_descends_by_filename(self):
+        # When mtimes are identical (HFS+ second-granularity, or
+        # rsync-preserving), descending filename order MUST win.
+        # The agent's UUID-based filenames have a monotonic prefix
+        # so descending == newest.
+        import os.path as _op
+        with tempfile.TemporaryDirectory() as dd_root:
+            logs = os.path.join(dd_root, 'Logs', 'Build')
+            os.makedirs(logs)
+            a = _op.join(logs, 'AAAA.xcactivitylog')
+            z = _op.join(logs, 'ZZZZ.xcactivitylog')
+            open(a, 'wb').close()
+            open(z, 'wb').close()
+            # Set identical mtimes (use os.utime).
+            os.utime(a, (1_700_000_000, 1_700_000_000))
+            os.utime(z, (1_700_000_000, 1_700_000_000))
+
+            objroot = os.path.join(dd_root, 'Build', 'Intermediates.noindex')
+            os.makedirs(objroot)
+            picked = agent._find_latest_xcactivitylog(objroot)
+            self.assertEqual(os.path.basename(picked), 'ZZZZ.xcactivitylog')
+
+
 if __name__ == '__main__':
     unittest.main()

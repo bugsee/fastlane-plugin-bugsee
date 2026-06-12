@@ -83,6 +83,65 @@ These fields are accepted verbatim by the appserver's
 finalised by the Android Gradle plugin; the iOS side simply joins
 the contract.
 
+### iOS build timings via xcactivitylog
+
+Ports the SLF (Source Log Format) tokenizer, section extractor,
+category classifier, and timing orchestrator from the iOS SDK's
+`tools.bundle/BugseeAgent` into the fastlane plugin's `BugseeAgent`
+(~800 LOC verbatim port — code is battle-tested in the SDK, so
+re-implementing would only create divergence).
+
+The existing dependencies pipeline now ALSO collects per-task
+build durations from the latest `.xcactivitylog` Xcode wrote
+under `$DERIVED_DATA/Logs/Build/` and threads them into the
+same build-registration round-trip:
+
+- **Inline summary** — `build_metadata.timings` carries
+  `total_ms`, `top_tasks`, and per-category sums
+  (`native_ms` / `resources_ms` / `packaging_ms` / `other_ms`).
+  `managed_code_ms` is never emitted on iOS (reserved for JVM
+  bytecode pipelines on Android); the wire shape is identical
+  between platforms so the back-end and the dashboard render
+  both from one schema.
+- **Detail blob** — the full per-task Gantt-chart-grade
+  timeline is gzipped and PUT to the new `timings_upload_endpoint`
+  the appserver returns alongside `dependencies_upload_endpoint`.
+
+The deps and timings PUTs are independent: a failed deps upload
+does NOT skip the timings upload (and vice versa), and either
+PUT failing does NOT block the dSYM upload that runs afterward.
+
+A pipeline run with NEITHER deps NOR timings produces no
+network call (previously a missing lockfile alone would have
+short-circuited even if timings were available).
+
+Test coverage (+21 unittests, 161 total now):
+
+  - `_classify_section_title` — 11 cases pinning the
+    native / resources / packaging / managed_code mapping
+    including the critical precedence carve-outs
+    (`Compiling Clang module` → native, `LinkStoryboards` →
+    resources NOT packaging, `Copy Swift standard libraries`
+    → packaging NOT native).
+  - `resolve_build_timings` soft-fail — empty env, missing
+    `$OBJROOT`, no `Logs/Build/` dir all degrade to
+    `(None, None)` rather than raising. A timings failure MUST
+    NOT block the parent pipeline.
+  - `_find_derived_data_root` — empty arg returns None, walk-up
+    finds the root from a deep child, 10-step cap prevents
+    walking to filesystem root on a malformed env.
+  - `_find_latest_xcactivitylog` — no logs returns None,
+    newest-mtime wins, descending-filename tie-break on equal
+    mtimes (HFS+ second-granularity / rsync-preserving CI
+    caches).
+
+The full SLF binary tokenizer + section extractor are not
+unit-tested here — they're best validated against real
+xcactivitylog files (deferred to integration testing on the
+SDK side, which has been parsing them in production for many
+releases). The pieces tested above are the iOS-platform-specific
+bits that don't depend on the binary format.
+
 ### Fixed
 
 - `upload_symbols_to_bugsee`'s `symbol_maps:` parameter is now

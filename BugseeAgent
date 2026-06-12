@@ -31,7 +31,9 @@ import gzip
 import plistlib
 import socket
 import time
+import math
 import platform
+import struct
 from optparse import OptionParser
 import fnmatch
 
@@ -1246,49 +1248,148 @@ def _put_dependencies_blob(endpoint_url, gz_bytes):
         return False
 
 
+def _put_timings_blob(url, gz_bytes, debug=False):
+    """Best-effort PUT of the gzipped per-task timeline DETAIL blob to
+    the presigned `timings_upload_endpoint` the metadata POST returned.
+
+    Mirrors `_put_dependencies_blob` exactly — independent of the
+    artefact upload, runs on the build-info-only path too, never
+    raises (a failed PUT degrades to "no Gantt chart for this build"
+    and must not break the user's archive flow). Returns True on a
+    2xx, False otherwise.
+
+    `Content-Type` is hard-set to `application/octet-stream` because
+    the back-end signs the presigned URL over exactly that value —
+    S3 403s the PUT on any Content-Type mismatch.
+    """
+    if not url or not gz_bytes:
+        return False
+    try:
+        put_req = urllib.request.Request(url, data=gz_bytes, method='PUT')
+        # Precise Content-Length so the signed request body-length
+        # matches; chunked transfer-encoding breaks S3 presigned PUTs.
+        put_req.add_header('Content-Length', str(len(gz_bytes)))
+        put_req.add_header('Content-Type', 'application/octet-stream')
+        with urllib.request.urlopen(put_req, timeout=120) as resp:
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        print("Bugsee: timings PUT failed (HTTP %d)" % e.code)
+        return False
+    except Exception as e:
+        print("Bugsee: timings PUT network error: %s" % e)
+        return False
+
+    if 200 <= status < 300:
+        if debug:
+            print("Bugsee: timings blob uploaded (%d bytes, HTTP %d)"
+                  % (len(gz_bytes), status))
+        return True
+    print("Bugsee: timings PUT unexpected status: %d" % status)
+    return False
+
+
 def _run_dependencies_pipeline(app_token, project_root):
     """Top-level driver wired into [main] when --deps is enabled.
 
-    Returns True on a successful end-to-end run (build registered
-    AND blob uploaded) or False on any failure. Logs a one-line
-    status summary either way so CI logs surface the outcome.
-    Failures here MUST NOT block the existing symbols-upload step
-    — both pipelines are independent.
+    Collects + uploads the project's dependency graph AND the
+    build's xcactivitylog-derived timings (when available) in ONE
+    build-registration round-trip. Both pieces of data are
+    optional — if neither produced useful output the function
+    short-circuits before the network call. Otherwise the
+    registration POST carries:
+
+      - `build_metadata.timings`  — inline summary (total_ms,
+        category sums, top tasks); always present when the
+        xcactivitylog was found.
+      - `dependencies_summary`   — total/direct/transitive counts,
+        collection_config; present when at least one lockfile
+        parsed.
+
+    The server responds with up to two presigned PUT endpoints:
+
+      - `dependencies_upload_endpoint` — for the full deps blob.
+      - `timings_upload_endpoint`      — for the full per-task
+        Gantt-detail blob.
+
+    Each PUT is best-effort and independent: a failed deps PUT
+    does NOT skip the timings PUT, and vice versa. The function
+    returns True only when registration succeeded AND every
+    attempted PUT succeeded; partial failures return False but
+    don't raise.
+
+    Failures here MUST NOT block the existing symbols-upload
+    step — both pipelines are independent.
     """
     entries, scope_label, truncated = _collect_all_dependencies(project_root)
-    if not entries:
-        print("Bugsee: no dependency sources found (Podfile.lock / "
-              "Package.resolved / Cartfile.resolved / linked frameworks); "
-              "skipping dependencies upload.")
-        return False
+    timings_summary, timings_gz = resolve_build_timings(os.environ)
 
-    summary, blob = _build_dependencies_payload(
-        entries, truncated, scope_label,
-        include_selected_reason=False,
-        max_count=DEPENDENCIES_MAX_COUNT,
-    )
+    have_deps    = bool(entries)
+    have_timings = timings_summary is not None
+
+    if not have_deps and not have_timings:
+        print("Bugsee: no dependency sources found and no build timings "
+              "available; skipping build-info upload.")
+        return False
 
     body = _collect_build_metadata()
     body["uuid"] = _extract_first_dwarf_uuid()
     body["request_artifact_upload"]      = False
-    body["request_dependencies_upload"]  = True
-    body["dependencies_summary"]         = summary
+    body["request_dependencies_upload"]  = have_deps
+    body["request_timings_upload"]       = timings_gz is not None
+
+    deps_blob_gz = None
+    if have_deps:
+        deps_summary, deps_blob = _build_dependencies_payload(
+            entries, truncated, scope_label,
+            include_selected_reason=False,
+            max_count=DEPENDENCIES_MAX_COUNT,
+        )
+        body["dependencies_summary"] = deps_summary
+        deps_blob_gz = _gzip_json_bytes(deps_blob)
+
+    if have_timings:
+        # Inline timings summary lives under build_metadata so the
+        # server-side rollup (total_ms, top tasks, category sums)
+        # is available without fetching the detail blob. The blob
+        # itself is uploaded separately via the presigned URL.
+        body.setdefault("build_metadata", {})["timings"] = timings_summary
 
     response = _request_build_registration(
         app_token, options.endpoint, json.dumps(body))
     if not response:
         return False
 
-    deps_endpoint = response.get('dependencies_upload_endpoint')
-    if not deps_endpoint:
-        print("Bugsee: server did not return a dependencies upload endpoint — "
-              "skipping deps PUT.")
-        return False
+    overall_ok = True
 
-    gz_bytes = _gzip_json_bytes(blob)
-    print("Bugsee: uploading dependencies blob (%d entries, %d bytes gzipped)"
-          % (len(entries), len(gz_bytes)))
-    return _put_dependencies_blob(deps_endpoint, gz_bytes)
+    if have_deps and deps_blob_gz is not None:
+        deps_endpoint = response.get('dependencies_upload_endpoint')
+        if not deps_endpoint:
+            print("Bugsee: server did not return a dependencies upload "
+                  "endpoint — skipping deps PUT.")
+            overall_ok = False
+        else:
+            print("Bugsee: uploading dependencies blob (%d entries, "
+                  "%d bytes gzipped)"
+                  % (len(entries), len(deps_blob_gz)))
+            if not _put_dependencies_blob(deps_endpoint, deps_blob_gz):
+                overall_ok = False
+
+    if timings_gz is not None:
+        timings_endpoint = response.get('timings_upload_endpoint')
+        if not timings_endpoint:
+            # Older appservers may not surface the timings endpoint
+            # yet — the inline summary still landed via the POST,
+            # so this isn't a hard failure.
+            print("Bugsee: server did not return a timings upload "
+                  "endpoint — inline summary kept; per-task detail "
+                  "blob skipped.")
+        else:
+            print("Bugsee: uploading build timings blob (%d bytes gzipped)"
+                  % len(timings_gz))
+            if not _put_timings_blob(timings_endpoint, timings_gz):
+                overall_ok = False
+
+    return overall_ok
 
 
 def isInUploadedList(images, imageList):
@@ -1439,6 +1540,816 @@ def uploadZipFile(zipFileLocation):
             retries += 1
 
     return False
+
+# ──────────────────────────────────────────────────────────────────
+# Build timings via xcactivitylog (ported from SDK BugseeAgent)
+#
+# Parses Xcode's .xcactivitylog (SLF0-compressed binary format) to
+# extract per-task durations + category rollups for the build
+# registration's `build_metadata.timings` sub-object. Same schema
+# the Android Gradle plugin's BuildTimingService emits, so the
+# back-end renders iOS and Android timings from one wire shape.
+# ──────────────────────────────────────────────────────────────────
+
+_SLF_SECTION_CLASS = 'IDEActivityLogSection'
+_SLF_COMMAND_CLASS = 'IDEActivityLogCommandInvocationSection'
+_SLF_SECTION_CLASSES = frozenset((_SLF_SECTION_CLASS, _SLF_COMMAND_CLASS))
+
+# SLF token delimiters. The three LENGTH-PREFIXED forms (`"` string,
+# `%` className-def, `*` JSON/data blob) carry a DECIMAL length whose
+# raw bytes follow; the rest are SIMPLE (`#` hex int, `^` hex double,
+# `@` hex classRef, `(` array/object element count, `-` null).
+_SLF_LEN_PREFIXED = b'"%*'
+_SLF_SIMPLE = b'#^@(-'
+_SLF_DELIMS = frozenset(_SLF_LEN_PREFIXED + _SLF_SIMPLE)
+_SLF_LEN_PREFIXED_SET = frozenset(_SLF_LEN_PREFIXED)
+
+
+# Per-category title classifier for iOS build events. Wire shape is
+# the same as the Android Gradle plugin's (`managed_code_ms` /
+# `native_ms` / `resources_ms` / `packaging_ms` / `other_ms`) so
+# back-end + front-end render both platforms from a single schema.
+# Semantic mapping for iOS:
+#
+#   managed_code_ms → never emitted on iOS. Reserved for JVM-
+#                     bytecode pipelines (kotlinc / javac / R8 /
+#                     desugar) on Android. Everything iOS compiles
+#                     is native code — Swift, Obj-C, C and C++ all
+#                     flow through clang/swiftc into the Mach-O.
+#   native_ms       → Swift + Obj-C + C/C++ compile units, Swift
+#                     module planning / emission / clang module
+#                     building. Dominates almost every iOS build.
+#                     Matches the Android semantic (JNI/C++ compile
+#                     via CMake / NDK lands in `native_ms` there).
+#   resources_ms    → asset catalogs, storyboards, xibs, strings,
+#                     plist processing, resource copies.
+#   packaging_ms    → linking, code signing, framework embedding,
+#                     strip, touch, dSYM generation, Swift stdlib
+#                     embedding (conceptually "get the runtime into
+#                     the bundle").
+#   other_ms        → build-graph dependency computation, tool
+#                     version discovery, auxiliary file generation,
+#                     Swift Package Manager resolution steps — the
+#                     scaffolding that isn't otherwise classified.
+#                     Typically <1% on a simple app build; SPM-heavy
+#                     projects can push this higher as `Computing
+#                     package information` / `Copying Package.resolved`
+#                     / `Resolve Package Graph` all land in this
+#                     bucket.
+#
+# Wrapper prefixes filter FIRST so container sections contribute to
+# no category; within the remaining rules, precedence is native →
+# resources → packaging (each list is checked in order and the
+# first match wins).
+_XCACTIVITYLOG_CATEGORY_NATIVE_PATTERNS = (
+    # Per-source compile events: "Compile Foo.swift (arm64)", etc.
+    re.compile(r'^Compile \S+\.(swift|m|mm|c|cpp|cxx|cc)\b', re.IGNORECASE),
+    re.compile(r'^CompileSwiftSources\b'),
+    re.compile(r'^CompileC\b'),
+    re.compile(r'^CompileSwift\b'),
+    # Swift toolchain phases — planning / driver / module emission.
+    re.compile(r'^Planning Swift module\b'),
+    re.compile(r'^SwiftDriver\b'),
+    re.compile(r'^Emit(?:ting)? [Ss]wift [Mm]odule\b'),
+    re.compile(r'^Emitting module for\b'),
+    re.compile(r'^SwiftMergeGeneratedHeaders\b'),
+    re.compile(r'^SwiftVerifyEmittedModuleInterface\b'),
+    re.compile(r'^Generate Swift Constant Values\b'),
+    # Explicit module / Clang module builds pulled into Swift.
+    # NOTE: `^Compiling Clang module` is also special-cased in
+    # `_classify_section_title` ahead of the wrapper check — the
+    # `Compiling ` wrapper prefix would otherwise intercept it.
+    re.compile(r'^Compiling Clang module\b'),
+    re.compile(r'^Precompile module\b'),
+    re.compile(r'^Explicitly Built\b'),
+    re.compile(r'^Discovering version info for swiftc\b'),
+    re.compile(r'^Extract app intents metadata\b', re.IGNORECASE),
+)
+_XCACTIVITYLOG_CATEGORY_RESOURCES_PATTERNS = (
+    re.compile(r'^Compile asset catalog', re.IGNORECASE),
+    re.compile(r'^CompileAssetCatalog\b'),
+    re.compile(r'^CompileStoryboard\b'),
+    re.compile(r'^CompileXIB\b'),
+    re.compile(r'^CompileXCStrings\b'),
+    # `LinkStoryboards` must be caught here, before the packaging
+    # tuple's generic `^Link\b` rule claims it. The native →
+    # resources → packaging precedence in `_classify_section_title`
+    # is what keeps this working — do not reorder.
+    re.compile(r'^LinkStoryboards\b'),
+    re.compile(r'^CompileStrings\b'),
+    re.compile(r'^ProcessInfoPlistFile\b'),
+    re.compile(r'^CpResource\b'),
+    re.compile(r'^CopyPlistFile\b'),
+    re.compile(r'^CopyStringsFile\b'),
+    re.compile(r'^CopyTiffFile\b'),
+    re.compile(r'^CopyPNGFile\b'),
+    re.compile(r'^GenerateAssetSymbols\b'),
+)
+_XCACTIVITYLOG_CATEGORY_PACKAGING_PATTERNS = (
+    re.compile(r'^Link\b'),
+    re.compile(r'^Ld\b'),
+    re.compile(r'^CodeSign\b'),
+    re.compile(r'^Sign \b'),
+    re.compile(r'^SignManifestFile\b'),
+    re.compile(r'^Strip\b'),
+    re.compile(r'^Touch\b'),
+    re.compile(r'^Embed\b'),
+    re.compile(r'^ProcessProductPackaging\b'),
+    re.compile(r'^RegisterExecutionPolicyException\b'),
+    re.compile(r'^Validate\b'),
+    re.compile(r'^GenerateDSYMFile\b'),
+    re.compile(r'^CreateUniversalBinary\b'),
+    # Swift stdlib embedding — `swift-stdlib-tool` copies the Swift
+    # runtime dylibs into the app bundle. Conceptually packaging,
+    # not compilation.
+    re.compile(r'^Copy Swift standard libraries\b'),
+)
+
+
+def _find_derived_data_root(obj_root):
+    """Walk up from `$OBJROOT` looking for the first ancestor that has
+    a `Logs/Build/` subdirectory — that's Xcode's per-project
+    DerivedData root. Returns the path, or None when not found.
+
+    `$OBJROOT` during `archive` typically resolves to
+    `<DerivedData>/Build/Intermediates.noindex/ArchiveIntermediates/
+    <SchemeName>/IntermediateBuildFilesPath`, so the ancestor walk
+    usually crosses four or five directory levels before hitting the
+    logs folder. Bounded by an explicit step cap so a malformed
+    `$OBJROOT` never sends us walking to `/`.
+    """
+    if not obj_root:
+        return None
+    current = os.path.normpath(obj_root)
+    for _ in range(10):
+        candidate = os.path.join(current, 'Logs', 'Build')
+        if os.path.isdir(candidate):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+    return None
+
+
+def _find_latest_xcactivitylog(obj_root):
+    """Return the path to the newest `.xcactivitylog` Xcode wrote for
+    this project, or None if the log directory can't be located.
+
+    "Newest" is resolved by mtime — Xcode writes one log file per
+    build/archive, so the most-recently-modified one in `Logs/Build/`
+    corresponds to the archive we're currently running under.
+
+    TODO(timings): Multi-arch archives (Mac Catalyst, iOS + macOS
+    targets in one workspace) can place the relevant log in a sibling
+    `Logs/Build/` directory we don't search. The current
+    newest-mtime-in-the-discovered-dir strategy is deterministic but
+    may pick the wrong arch's log on such projects. Cross-directory
+    search deferred.
+
+    TODO(timings): Stale-log detection — if the newest `.xcactivitylog`
+    was written before the current build started, we'd report
+    pre-build numbers as if they were this build's. No retry / warning
+    is emitted today; consider checking the file's mtime against
+    `os.environ.get('BUILD_TIMESTAMP')` or similar before parsing.
+    """
+    dd_root = _find_derived_data_root(obj_root)
+    if not dd_root:
+        return None
+    log_dir = os.path.join(dd_root, 'Logs', 'Build')
+    try:
+        entries = [
+            os.path.join(log_dir, f)
+            for f in os.listdir(log_dir)
+            if f.endswith('.xcactivitylog')
+        ]
+    except OSError:
+        return None
+    if not entries:
+        return None
+    # Tie-break by filename so sibling logs with the same
+    # second-granularity mtime (HFS+ filesystems, rsync-preserving-
+    # mtime CI caches) don't shuffle non-deterministically. Xcode
+    # encodes a monotonic timestamp at the start of each log's
+    # UUID-based filename, so descending-by-name pairs well with
+    # descending-by-mtime.
+    entries.sort(
+        key=lambda p: (os.path.getmtime(p), os.path.basename(p)),
+        reverse=True,
+    )
+    return entries[0]
+
+
+def _tokenize_slf(data):
+    """Tokenize an `SLF0` byte stream into a flat `[(type, value), …]`
+    list. `data` is the DECOMPRESSED stream (the leading 4-byte `SLF0`
+    header is skipped here).
+
+    Each token is `<ascii-payload><1-byte-delimiter>`:
+      - `"` / `%` / `*` are LENGTH-PREFIXED: the payload is a DECIMAL
+        length, then that many raw bytes follow and become the token's
+        value (decoded as UTF-8, replacement on error). The single
+        nastiest bug here is that the length is DECIMAL, NOT hex, and
+        that `*` (JSON/data blob) MUST consume its length in bytes or
+        the whole stream desyncs.
+      - `^` is a double: 16 hex chars, little-endian IEEE-754. Value is
+        the float, or None if malformed.
+      - `#` / `@` are ints: HEX payload. `#` is a plain int, `@` is a
+        1-based class-table reference. Value is the parsed int.
+      - `(` is an array/object header: HEX payload is the element
+        count. Value is that int.
+      - `-` is null. Value is None.
+
+    Returns `(tokens, desync_count)`. `desync_count` is the number of
+    malformed length/number payloads encountered — non-zero hints the
+    grammar drifted, but parsing continues best-effort.
+    """
+    tokens = []
+    desync = 0
+    i = 4  # skip the 4-byte 'SLF0' header
+    n = len(data)
+    payload = bytearray()
+    while i < n:
+        b = data[i]
+        if b in _SLF_DELIMS:
+            t = chr(b)
+            p = payload.decode('ascii', 'replace')
+            payload = bytearray()
+            i += 1
+            if b in _SLF_LEN_PREFIXED_SET:
+                # DECIMAL length, then that many raw bytes.
+                try:
+                    ln = int(p, 10) if p else 0
+                except ValueError:
+                    ln = 0
+                    desync += 1
+                tokens.append((t, data[i:i + ln].decode('utf-8', 'replace')))
+                i += ln
+            elif t == '^':
+                if len(p) == 16:
+                    try:
+                        tokens.append((t, struct.unpack('<d', bytes.fromhex(p))[0]))
+                    except Exception:
+                        tokens.append((t, None))
+                        desync += 1
+                else:
+                    tokens.append((t, None))
+            else:
+                # '#', '@', '(' carry a HEX payload; '-' carries none.
+                try:
+                    tokens.append((t, int(p, 16) if p else 0))
+                except ValueError:
+                    tokens.append((t, None))
+                    desync += 1
+        else:
+            payload.append(b)
+            i += 1
+    return tokens, desync
+
+
+def _extract_slf_sections(tokens):
+    """Walk a tokenized SLF stream and extract every section instance
+    as a `(cls, title, start_cf, end_cf)` tuple.
+
+    The class table is every `%` className-def in stream order, 1-based;
+    an `@N` token references the N-th def. A section instance starts at
+    an `@`-ref to one of the two section classes, immediately followed
+    by tokens of types `# " " " ^ ^` (sectionType, domainType, title,
+    signature, timeStarted, timeStopped) and then a subSections field
+    that is `(` (array) or `-` (none). We read:
+      - `cls`      — the referenced class name.
+      - `title`    — the 3rd string (index +3).
+      - `start_cf` — the 1st double (index +5), CFAbsoluteTime seconds.
+      - `end_cf`   — the 2nd double (index +6), CFAbsoluteTime seconds.
+
+    Sections with a missing / non-finite / inverted timestamp pair are
+    dropped (they can't contribute to span, occupancy, or the Gantt).
+
+    No tree reconstruction is attempted: containment is resolved later
+    by interval math, which is robust to the subSection-count drift
+    that an explicit child-count stack walk is prone to on real logs.
+    """
+    class_table = [v for (t, v) in tokens if t == '%']
+    ntok = len(tokens)
+
+    def class_of(idx):
+        if isinstance(idx, int) and 1 <= idx <= len(class_table):
+            return class_table[idx - 1]
+        return None
+
+    sections = []
+    for k in range(ntok - 7):
+        t, v = tokens[k]
+        if t != '@':
+            continue
+        cls = class_of(v)
+        if cls not in _SLF_SECTION_CLASSES:
+            continue
+        # Shape check: # " " " ^ ^ then ( or - .
+        if (tokens[k + 1][0] != '#' or tokens[k + 2][0] != '"'
+                or tokens[k + 3][0] != '"' or tokens[k + 4][0] != '"'
+                or tokens[k + 5][0] != '^' or tokens[k + 6][0] != '^'
+                or tokens[k + 7][0] not in ('(', '-')):
+            continue
+        title = tokens[k + 3][1]
+        start_cf = tokens[k + 5][1]
+        end_cf = tokens[k + 6][1]
+        if start_cf is None or end_cf is None:
+            continue
+        if not (math.isfinite(start_cf) and math.isfinite(end_cf)):
+            continue
+        if end_cf < start_cf:
+            continue
+        sections.append((cls, title, start_cf, end_cf))
+    return sections
+
+
+def _interval_union_seconds(intervals):
+    """Total length (seconds) of the UNION of `[start, end]` intervals
+    — the OCCUPANCY metric. Overlapping windows are merged, so the
+    result can never exceed wall-clock. This is the fix for the flat
+    code's per-category SUM, which double-counted Swift batch windows
+    replicated onto every file's command section.
+
+    `intervals` is an iterable of `(start, end)` float pairs (any
+    order). Returns 0.0 for an empty input.
+    """
+    ordered = sorted(intervals)
+    total = 0.0
+    cur_start = cur_end = None
+    for s, e in ordered:
+        if cur_start is None:
+            cur_start, cur_end = s, e
+        elif s <= cur_end:
+            if e > cur_end:
+                cur_end = e
+        else:
+            total += cur_end - cur_start
+            cur_start, cur_end = s, e
+    if cur_start is not None:
+        total += cur_end - cur_start
+    return total
+
+
+def _classify_section_title(title):
+    """Map a command-invocation section title to one of the cross-
+    platform category buckets: `'native'`, `'resources'`,
+    `'packaging'`, `'other'`. (iOS never emits `'managed_code'` — see
+    the mapping docstring above the pattern tuples.) Returns `None`
+    only for an empty title. Precedence-ordered regex scan — first
+    match wins.
+
+    Callers pass COMMAND-invocation titles (`IDEActivityLogCommand-
+    InvocationSection`), never the grouping wrappers, so there is no
+    longer a wrapper-title escape hatch here: the SLF section-tree
+    walk already separates the two classes, and per-category OCCUPANCY
+    (interval union over command sections) is what feeds the chips,
+    so a parallel build's occupancy can never exceed wall-clock
+    `total_ms`. The dominant-category logic in `_build_timeline_blob`
+    reuses this same classifier on the commands contained within each
+    target window.
+    """
+    if not title:
+        return None
+    # `Compiling Clang module <name>` is a real native compile event
+    # (explicit module build); list it ahead of the generic patterns
+    # so it lands in `native` rather than `other`.
+    if title.startswith('Compiling Clang module'):
+        return 'native'
+    for p in _XCACTIVITYLOG_CATEGORY_NATIVE_PATTERNS:
+        if p.match(title):
+            return 'native'
+    for p in _XCACTIVITYLOG_CATEGORY_RESOURCES_PATTERNS:
+        if p.match(title):
+            return 'resources'
+    for p in _XCACTIVITYLOG_CATEGORY_PACKAGING_PATTERNS:
+        if p.match(title):
+            return 'packaging'
+    return 'other'
+
+
+# `/Users/<name>` matches the username token regardless of what
+# follows. Earlier we anchored on `(?=/|$)` so the lookahead would
+# require either a path separator or end-of-string — but Xcode
+# occasionally embeds bare user-home references in the middle of
+# titles (e.g. `"warning at /Users/alice and exit"`), and the
+# anchored form let the username slip past, where the catch-all
+# `_ABSOLUTE_PATH_RE` then reduced `/Users/alice` to basename
+# `alice` — emitting the bare username as a standalone word.
+#
+# Username character class is restricted to `[A-Za-z0-9._\-]+` (the
+# realistic Unix-username surface) rather than `[^/\s]+`. The broader
+# negation would also consume trailing punctuation (`,`, `)`, `:`,
+# `;`, `.`) when the username appears mid-title, producing slightly
+# mangled surrounding text in the emitted name. The narrower class
+# stops at the first non-username character so the surrounding
+# sentence preserves its shape (`"see /Users/alice)"` →
+# `"see <home>)"`, not `"see <home>"`).
+_PATH_USER_HOME_RE = re.compile(r'/Users/[A-Za-z0-9._\-]+')
+_PATH_PRIVATE_VAR_FOLDERS_RE = re.compile(
+    r'/private/var/folders/[^\s]+'
+)
+_ABSOLUTE_PATH_RE = re.compile(r'(?<!\S)(/[^\s]+)')
+
+
+def _sanitize_section_title_for_emission(title):
+    """Strip PII (username, machine-local paths) out of an xcactivitylog
+    section title before it ships in `top_tasks`.
+
+    Xcode often embeds absolute paths in section titles (e.g.
+    `Compile /Users/alice/Projects/MyApp/Sources/Foo.swift`). We:
+      - replace `/Users/<name>/` with `<home>/` (drops the username),
+      - collapse `/private/var/folders/...` paths to their basename
+        (TemporaryItems / DerivedData scratch paths leak machine UUIDs),
+      - reduce any other absolute path token to its basename.
+    Non-path tokens pass through unchanged so titles like
+    `Compile Foo.swift (arm64)` are emitted verbatim.
+    """
+    if not title:
+        return title
+
+    def _replace_user_home(m):
+        return '<home>'
+
+    def _replace_private_var(m):
+        return os.path.basename(m.group(0))
+
+    def _replace_absolute(m):
+        path = m.group(1)
+        if path.startswith('<home>'):
+            return path
+        return os.path.basename(path) or path
+
+    sanitized = _PATH_USER_HOME_RE.sub(_replace_user_home, title)
+    sanitized = _PATH_PRIVATE_VAR_FOLDERS_RE.sub(_replace_private_var, sanitized)
+    sanitized = _ABSOLUTE_PATH_RE.sub(_replace_absolute, sanitized)
+    return sanitized
+
+
+def _dominant_category_for_window(commands, win_start, win_end):
+    """Return the DOMINANT category for a target window — the category
+    with the greatest command-OCCUPANCY (interval union, not sum) among
+    the command-invocations whose `[start, end]` is CONTAINED within
+    `[win_start, win_end]`.
+
+    Containment (rather than overlap) keeps each command attributed to
+    exactly the target it belongs to; a command that straddles a target
+    boundary (rare, and usually a build-system bookkeeping section) is
+    simply not counted toward that target's category.
+
+    `commands` is a list of `(category, start_cf, end_cf)` tuples for
+    every classified command-invocation in the build. Returns `'native'`
+    when the window contains no classifiable command (a target made up
+    of only build-graph bookkeeping still renders as a native bar rather
+    than vanishing).
+    """
+    by_cat = {}
+    for cat, s, e in commands:
+        if s >= win_start and e <= win_end:
+            by_cat.setdefault(cat, []).append((s, e))
+    if not by_cat:
+        return 'native'
+    best_cat = 'native'
+    best_occ = -1.0
+    for cat, intervals in by_cat.items():
+        occ = _interval_union_seconds(intervals)
+        if occ > best_occ:
+            best_occ = occ
+            best_cat = cat
+    return best_cat
+
+
+def _build_timeline_blob(targets, build_start_cf):
+    """Build the Gantt-chart DETAIL blob from the per-target grouping
+    records. `targets` is a list of `(path, category, start_cf, end_cf)`
+    tuples — one per `Build target ` grouping, with `category` already
+    resolved to the target's DOMINANT command-category — and
+    `build_start_cf` is the build's earliest section start in
+    CFAbsoluteTime.
+
+    Wire shape (unchanged from the flat implementation, and mirroring
+    the Android Gradle plugin's `TimingsPayloadSerializer` so back-end
+    + front-end render both platforms from one schema):
+
+      { "schema_version": 1,
+        "build_started_at_ms": <epoch ms of build start>,
+        "wall_clock_ms": <max end − min start over targets, ms>,
+        "tasks": [ {"path", "category", "start_ms", "end_ms"}, … ] }
+
+    Rules:
+      - `start_ms`/`end_ms` are OFFSETS from `build_started_at_ms`
+        (not absolute), in ms.
+      - tasks sorted by `start_ms` ascending.
+      - capped at `_TIMELINE_MAX_TASKS`; when truncating we keep the
+        SLOWEST targets, then re-sort the kept slice by start.
+
+    Unlike the old code, the rows are the per-target GROUPINGS — NOT
+    per-file leaf sections — so the Gantt shows ~one bar per target
+    (low-double-digit peak concurrency) rather than 300+ phantom
+    parallel bars. The mega-wrappers (root build / `Prepare build` /
+    `Run post-actions` / `Prepare packages`) were already filtered out
+    by the caller.
+
+    Returns the blob dict, or None when there are no target groupings —
+    callers then PUT nothing.
+    """
+    if not targets:
+        return None
+
+    # `build_started_at_ms` is anchored to the WHOLE build's start (the
+    # earliest section of any class), so per-target offsets are relative
+    # to t0 of the build, not to the earliest target.
+    build_started_at_ms = int(round(
+        (build_start_cf + _CF_ABSOLUTE_TIME_EPOCH_OFFSET) * 1000))
+    latest_end_cf = max(e for _p, _c, _s, e in targets)
+    wall_clock_ms = max(0, int(round((latest_end_cf - build_start_cf) * 1000)))
+
+    # Truncation keeps the SLOWEST targets (sort by duration desc,
+    # slice), then re-sorts the kept slice chronologically so the array
+    # reads start-ordered for the front-end's greedy-lane Gantt packer.
+    if len(targets) > _TIMELINE_MAX_TASKS:
+        print(
+            "Bugsee: build-timings detail blob truncated "
+            "(%d targets -> %d slowest kept)"
+            % (len(targets), _TIMELINE_MAX_TASKS)
+        )
+        kept = sorted(
+            targets, key=lambda t: t[3] - t[2], reverse=True
+        )[:_TIMELINE_MAX_TASKS]
+    else:
+        kept = targets
+
+    tasks = [
+        {
+            'path': _sanitize_section_title_for_emission(path)[:255],
+            'category': category,
+            'start_ms': int(round((start_cf - build_start_cf) * 1000)),
+            'end_ms': int(round((end_cf - build_start_cf) * 1000)),
+        }
+        for path, category, start_cf, end_cf in sorted(kept, key=lambda t: t[2])
+    ]
+
+    return {
+        'schema_version': _TIMELINE_SCHEMA_VERSION,
+        'build_started_at_ms': build_started_at_ms,
+        'wall_clock_ms': wall_clock_ms,
+        'tasks': tasks,
+    }
+
+
+def _timeline_blob_gz(blob):
+    """Gzip the compact JSON timeline blob, mirroring `_deps_blob_gz`
+    (compact separators, `gzip.compress`). Shape matches the Android
+    Gradle plugin's `TimingsPayloadSerializer.gzipBytes`."""
+    raw = json.dumps(blob, separators=(',', ':')).encode('utf-8')
+    return gzip.compress(raw)
+
+
+def _parse_xcactivitylog(log_path):
+    """Extract the build's wall-clock span, per-category OCCUPANCY, a
+    top-N slowest-targets list, AND a per-target Gantt timeline from an
+    `.xcactivitylog`, using a proper SLF section-tree decode.
+
+    Pipeline:
+      1. Decompress + `_tokenize_slf` the `SLF0` stream.
+      2. `_extract_slf_sections` → every `(cls, title, start, end)`
+         section instance, split into the two section classes.
+      3. `total_ms`      = wall-clock SPAN (`max(end) − min(start)`)
+                           over ALL sections.
+      4. `category_sums` = per-category OCCUPANCY (interval union) over
+                           the COMMAND-invocation sections, classified
+                           by title. Occupancy can never exceed
+                           wall-clock — the fix for the flat code's
+                           batch-inflated SUMs.
+      5. targets         = the `IDEActivityLogSection` groupings whose
+                           title starts with `Build target ` (the
+                           mega-wrappers are excluded). Each target's
+                           DOMINANT category is the category with the
+                           greatest command-occupancy among commands
+                           contained within its window.
+      6. `top_tasks`     = the slowest targets (name + duration_ms),
+                           capped at `_XCACTIVITYLOG_TOP_N`.
+      7. `timeline`      = the Gantt blob (one row per target).
+
+    Returns a dict with `total_ms` / `top_tasks` / `category_sums` /
+    `timeline`, or None when the log can't be opened / decompressed /
+    tokenized into any section at all.
+    """
+    try:
+        with gzip.open(log_path, 'rb') as g:
+            data = g.read(_XCACTIVITYLOG_MAX_DECOMPRESSED + 1)
+    except Exception:
+        return None
+
+    if len(data) > _XCACTIVITYLOG_MAX_DECOMPRESSED:
+        # Truncated to cap memory; a truncated tail loses late sections
+        # anyway. Work with what we have — the class table and the root
+        # section live at the head of the stream.
+        data = data[:_XCACTIVITYLOG_MAX_DECOMPRESSED]
+
+    tokens, _desync = _tokenize_slf(data)
+    sections = _extract_slf_sections(tokens)
+    if not sections:
+        return None
+
+    # total_ms = wall-clock SPAN over ALL sections. CFAbsoluteTime is
+    # seconds since 2001; the span is offset-independent so no epoch
+    # shift is needed here.
+    build_start_cf = min(s for _c, _t, s, _e in sections)
+    build_end_cf = max(e for _c, _t, _s, e in sections)
+    total_ms = max(0, int(round((build_end_cf - build_start_cf) * 1000)))
+
+    # Classify each COMMAND-invocation once; reused for both the
+    # category-occupancy chips and the per-target dominant category.
+    commands = []
+    for cls, title, s, e in sections:
+        if cls != _SLF_COMMAND_CLASS:
+            continue
+        bucket = _classify_section_title(title)
+        if bucket is None:
+            continue
+        commands.append((bucket, s, e))
+
+    # Per-category OCCUPANCY (interval union per bucket), in ms.
+    # `managed_code` is a cross-platform bucket iOS never fills (Swift /
+    # Obj-C / C/C++ all land in `native`); kept pre-seeded to zero for
+    # parity with Android, and the emission loop drops zero buckets.
+    by_cat_intervals = {}
+    for bucket, s, e in commands:
+        by_cat_intervals.setdefault(bucket, []).append((s, e))
+    category_sums = {
+        'managed_code': 0,
+        'native': 0,
+        'resources': 0,
+        'packaging': 0,
+        'other': 0,
+    }
+    for bucket, intervals in by_cat_intervals.items():
+        category_sums[bucket] = int(round(
+            _interval_union_seconds(intervals) * 1000))
+
+    # `Build target ` groupings → the Gantt rows + top_tasks. The four
+    # mega-wrappers (root build, `Prepare build`, `Prepare packages`,
+    # `Run post-actions`) are `IDEActivityLogSection` too but DON'T
+    # carry the `Build target ` prefix, so they're excluded — they span
+    # the whole build and would draw a single full-width bar.
+    targets = []
+    for cls, title, s, e in sections:
+        if cls != _SLF_SECTION_CLASS:
+            continue
+        if not title or not title.startswith(_XCACTIVITYLOG_TARGET_PREFIX):
+            continue
+        category = _dominant_category_for_window(commands, s, e)
+        # Strip the `Build target ` prefix for the emitted path.
+        path = title[len(_XCACTIVITYLOG_TARGET_PREFIX):] or title
+        targets.append((path, category, s, e))
+
+    # top_tasks = slowest target groupings, longest first, capped at
+    # TOP_N. Durations here are the target wall-clock windows (NOT
+    # batch-inflated per-file sums).
+    top_sorted = sorted(
+        targets, key=lambda t: t[3] - t[2], reverse=True)
+    top_tasks = []
+    for path, _category, s, e in top_sorted[:_XCACTIVITYLOG_TOP_N]:
+        dur = int(round((e - s) * 1000))
+        if dur < 1:  # sub-millisecond targets are noise
+            continue
+        top_tasks.append({
+            'name': _sanitize_section_title_for_emission(path)[:255],
+            'duration_ms': dur,
+        })
+
+    # Per-target Gantt blob. Offsets are relative to the WHOLE build's
+    # start so the bars line up with the absolute timeline.
+    timeline = _build_timeline_blob(targets, build_start_cf)
+
+    return {
+        'total_ms': total_ms,
+        'top_tasks': top_tasks,
+        'category_sums': category_sums,
+        'timeline': timeline,
+    }
+
+
+def resolve_build_timings(env):
+    """Produce the build's timing data for the current build.
+
+    Returns a `(timings, timeline_gz)` tuple:
+      - `timings`: the inline `build_metadata.timings` sub-object —
+        `total_ms` (wall-clock SPAN), a `top_tasks` list of the
+        slowest `Build target ` groupings, and a per-category rollup
+        (`native_ms` / `resources_ms` / `packaging_ms` / `other_ms`)
+        whose values are command-invocation OCCUPANCY (interval union,
+        so they never exceed `total_ms`). iOS never emits
+        `managed_code_ms` — Swift / Obj-C / C / C++ all compile into
+        the Mach-O and land in `native_ms`. The server schema shares
+        the field names with Android, which keeps `managed_code_ms`
+        populated (JVM-bytecode compilation: kotlinc / javac / R8 /
+        desugar).
+      - `timeline_gz`: the gzipped per-target Gantt DETAIL blob PUT to
+        the presigned `timings_upload_endpoint` for Gantt-chart parity
+        with Android's `timings.json`, or None when there's no
+        `Build target ` grouping to chart.
+
+    Either element may be None independently. `(None, None)` means no
+    timing source was available at all.
+
+    Wraps the entire pipeline in a broad except so any future parser
+    bug (e.g. an `inf`/`nan` slipping past the section filters and
+    overflowing duration arithmetic, or a malformed SLF stream
+    causing struct/unicode decode errors that weren't anticipated)
+    degrades gracefully to "no timings" instead of escaping into the
+    outer build-publish wrapper. The outer wrapper aborts the entire
+    build-info upload — losing timings is acceptable; losing the
+    build record is not.
+    """
+    try:
+        return _resolve_build_timings_impl(env)
+    except Exception as e:
+        print(
+            "Bugsee: build-timings extraction failed (%s) — "
+            "omitting timings from build_metadata" % str(e)
+        )
+        return None, None
+
+
+def _resolve_build_timings_impl(env):
+    obj_root = env.get('OBJROOT')
+    log_path = _find_latest_xcactivitylog(obj_root)
+    if not log_path:
+        return None, None
+    parsed = _parse_xcactivitylog(log_path)
+    if not parsed:
+        return None, None
+
+    # Server sanitizer drops fields that are falsy / None, but being
+    # explicit about omissions keeps the wire payload tidy. Emit
+    # zero-valued category sums as positive zeros so "no data" stays
+    # distinguishable from "genuinely zero time in this category" on
+    # the server — the sanitizer preserves zero-valued ints.
+    timings = {}
+    if parsed.get('total_ms'):
+        timings['total_ms'] = parsed['total_ms']
+    if parsed.get('top_tasks'):
+        timings['top_tasks'] = parsed['top_tasks']
+    for bucket, value in (parsed.get('category_sums') or {}).items():
+        if value > 0:
+            timings['%s_ms' % bucket] = value
+
+    # Per-task timeline DETAIL blob — gzipped only when it carries at
+    # least one task, so the caller never sets `request_timings_upload`
+    # nor PUTs an empty blob. Mirrors the deps-blob "summary + blob"
+    # split exactly.
+    timeline = parsed.get('timeline')
+    timeline_gz = None
+    if timeline and timeline.get('tasks'):
+        timeline_gz = _timeline_blob_gz(timeline)
+
+    return (timings or None), timeline_gz
+
+
+# -----------------------------------------------------------------
+# Build-publish flow + gate
+# -----------------------------------------------------------------
+#
+# The flow has two layers:
+#
+#   - **build-info** (default ON, release-only): every Release archive
+#     posts a build record to the Bugsee back-end carrying version,
+#     build, package_id, VCS, build-machine, plugin / Xcode / SDK
+#     versions, timings, and the artefact's file size. The record
+#     unlocks crash-context enrichment (commit lookup) and serves as
+#     the in-build size-check baseline. Disable via
+#     `BUGSEE_BUILD_INFO_ENABLED=0` for firewalled CI / privacy-
+#     sensitive builds.
+#
+#   - **size-analysis** (default OFF, sub-feature of build-info):
+#     when enabled, the build-info POST also asks the server for a
+#     presigned PUT URL and ships the artefact bytes for server-side
+#     tree analysis. Requires build-info to be enabled — the flow
+#     warns and skips both if size-analysis is on while build-info
+#     is off.
+
+
+def _env_truthy_default_true(value):
+    """`True` for missing / unset / empty values (treated as "default
+    on") AND for conventional truthy tokens. Used by the build-info
+    gate where the default is ON.
+
+    Empty string is treated as missing: many GUIs (Xcode's "Add
+    Environment Variable", some CI dashboards) emit `BUGSEE_…=""`
+    when the user leaves the value field blank. Treating `""` as
+    "off" would silently flip a user who *thought* they were
+    accepting the default into the disabled path — confusing and
+    invisible."""
+    if value is None:
+        return True
+    if not value.strip():
+        return True
+    return _env_truthy(value)
+
+
+
 
 def main():
     # Symbols-pipeline entry. The deps pipeline is now invoked
