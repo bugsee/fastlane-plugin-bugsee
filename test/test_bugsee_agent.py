@@ -599,5 +599,559 @@ class TestGzipJsonBytes(unittest.TestCase):
         self.assertNotIn(b'\n', decompressed)
 
 
+# ──────────────────────────────────────────────
+# Filesystem / Xcode-env helpers
+# ──────────────────────────────────────────────
+#
+# These wrap subprocess and os.walk against Xcode build-phase env
+# vars and the dSYM folder layout. They bridge between the env vars
+# and the parsers tested above — every silent breakage here would
+# surface as "no deps collected" with no error in the build log,
+# so they need explicit coverage.
+
+from types import SimpleNamespace
+from unittest import mock
+
+
+_OPTIONS_SENTINEL = object()
+
+
+def _install_options(agent_mod, **fields):
+    """Inject a fake `options` namespace onto the agent module.
+    BugseeAgent populates the real `options` only inside `main()` via
+    OptionParser.parse_args, which doesn't fire in the test loader.
+    The helpers reference attrs like `options.build_dir` /
+    `options.dsym_folder` / `options.version` / `options.build`, so
+    we hand them a SimpleNamespace with the expected slots and let
+    each test pass the values it needs.
+    Returns whatever was on the module before (sentinel if absent)
+    so tearDown can restore it.
+    """
+    prev = getattr(agent_mod, 'options', _OPTIONS_SENTINEL)
+    defaults = {
+        'build_dir':    None,
+        'dsym_folder':  None,
+        'version':      None,
+        'build':        None,
+    }
+    defaults.update(fields)
+    agent_mod.options = SimpleNamespace(**defaults)
+    return prev
+
+
+def _restore_options(agent_mod, prev):
+    if prev is _OPTIONS_SENTINEL:
+        try:
+            del agent_mod.options
+        except AttributeError:
+            pass
+    else:
+        agent_mod.options = prev
+
+
+# ──────────────────────────────────────────────
+# _parse_vendored_frameworks
+# ──────────────────────────────────────────────
+
+# Realistic otool -L sample. The first line is always the binary's
+# own install name (skipped because it doesn't start with `@rpath/`
+# unless the binary itself is dyld-staged). System dylibs follow,
+# then the embedded frameworks we actually want.
+_OTOOL_SAMPLE = (
+    "/private/var/staging/MyApp.app/MyApp:\n"
+    "\t@rpath/Bugsee.framework/Bugsee (compatibility version 1.0.0, current version 1.0.0)\n"
+    "\t@rpath/Alamofire.framework/Alamofire (compatibility version 1.0.0, current version 5.8.0)\n"
+    "\t@executable_path/Frameworks/Sentry.framework/Sentry (compatibility version 1.0.0, current version 8.0.0)\n"
+    "\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)\n"
+    "\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)\n"
+    "\t/System/Library/Frameworks/Foundation.framework/Foundation (compatibility version 300.0.0, current version 2402.0.0)\n"
+    "\t/System/Library/Frameworks/UIKit.framework/UIKit (compatibility version 1.0.0, current version 7167.0.0)\n"
+    # Duplicate of Bugsee — exercises the dedup `seen` set.
+    "\t@rpath/Bugsee.framework/Bugsee (compatibility version 1.0.0, current version 1.0.0)\n"
+)
+
+
+class TestParseVendoredFrameworks(unittest.TestCase):
+    def test_returns_empty_on_missing_path(self):
+        # Both branches of the path-guard short-circuit before
+        # subprocess is ever called.
+        self.assertEqual(agent._parse_vendored_frameworks(None), [])
+        self.assertEqual(agent._parse_vendored_frameworks('/no/such/binary'), [])
+
+    def _run_with_canned_output(self, otool_stdout):
+        # Write a placeholder file so the os.path.isfile guard
+        # passes; the actual bytes are irrelevant — subprocess is
+        # mocked out, but the guard checks the path itself.
+        path = _write_fixture('placeholder')
+        try:
+            with mock.patch('subprocess.run') as mocked:
+                mocked.return_value = SimpleNamespace(stdout=otool_stdout)
+                return agent._parse_vendored_frameworks(path)
+        finally:
+            os.unlink(path)
+
+    def test_emits_only_embedded_frameworks(self):
+        entries = self._run_with_canned_output(_OTOOL_SAMPLE)
+        names = [e['name'] for e in entries]
+        # Embedded frameworks from @rpath / @executable_path are
+        # surfaced, with the .framework basename (NOT the inner
+        # Mach-O slice name) as the entry name.
+        self.assertIn('Bugsee.framework', names)
+        self.assertIn('Alamofire.framework', names)
+        self.assertIn('Sentry.framework', names)
+        # System dylibs / Foundation / UIKit are filtered out.
+        self.assertNotIn('libobjc.A.dylib', names)
+        self.assertNotIn('libSystem.B.dylib', names)
+        self.assertNotIn('Foundation.framework', names)
+        self.assertNotIn('UIKit.framework', names)
+
+    def test_dedupes_when_same_framework_appears_twice(self):
+        entries = self._run_with_canned_output(_OTOOL_SAMPLE)
+        names = [e['name'] for e in entries]
+        # The sample lists Bugsee twice — must surface once. A naive
+        # parser that forgot the `seen` set would emit 2 Bugsee
+        # entries and the dashboard would render a phantom dup.
+        self.assertEqual(names.count('Bugsee.framework'), 1)
+
+    def test_entry_shape_matches_dep_contract(self):
+        entries = self._run_with_canned_output(_OTOOL_SAMPLE)
+        bugsee = next(e for e in entries if e['name'] == 'Bugsee.framework')
+        self.assertEqual(bugsee['type'], 'file')
+        self.assertEqual(bugsee['direct'], True)
+        self.assertEqual(bugsee['group'], '')
+        self.assertEqual(bugsee['parents'], [])
+        # `id` is the canonical file::Bugsee.framework form — pinned
+        # so the worker's identity dedup behaves identically across
+        # platforms.
+        self.assertEqual(bugsee['id'],
+                         agent._make_dep_id('file', '', 'Bugsee.framework'))
+
+    def test_otool_failure_returns_empty_not_raise(self):
+        # When otool itself errors (binary is fat-but-broken, or
+        # /usr/bin/otool isn't installed), the agent must NOT take
+        # the build down — return empty and let the rest of the
+        # deps pipeline carry on.
+        path = _write_fixture('placeholder')
+        try:
+            import subprocess as _sub
+            with mock.patch('subprocess.run',
+                            side_effect=_sub.CalledProcessError(1, 'otool')):
+                entries = agent._parse_vendored_frameworks(path)
+            self.assertEqual(entries, [])
+        finally:
+            os.unlink(path)
+
+
+# ──────────────────────────────────────────────
+# _read_info_plist
+# ──────────────────────────────────────────────
+
+class TestReadInfoPlist(unittest.TestCase):
+    def test_returns_empty_on_missing_path(self):
+        # None, empty string, nonexistent file — all three trigger
+        # the soft-fail. Caller treats {} as "no info; fall through
+        # to env vars".
+        self.assertEqual(agent._read_info_plist(None), {})
+        self.assertEqual(agent._read_info_plist(''), {})
+        self.assertEqual(agent._read_info_plist('/no/such/plist'), {})
+
+    def test_reads_xml_plist_fields(self):
+        import plistlib
+        fd, path = tempfile.mkstemp(suffix='.plist')
+        with os.fdopen(fd, 'wb') as f:
+            plistlib.dump({
+                'CFBundleShortVersionString': '1.2.3',
+                'CFBundleVersion':            '42',
+                'CFBundleIdentifier':         'com.example.app',
+            }, f)
+        try:
+            result = agent._read_info_plist(path)
+        finally:
+            os.unlink(path)
+        # All three keys round-trip — this is the same plistlib
+        # path the Xcode build phase relies on, so a future swap to
+        # a non-plistlib parser must preserve these fields verbatim.
+        self.assertEqual(result['CFBundleShortVersionString'], '1.2.3')
+        self.assertEqual(result['CFBundleVersion'],            '42')
+        self.assertEqual(result['CFBundleIdentifier'], 'com.example.app')
+
+    def test_malformed_plist_returns_empty_not_raise(self):
+        # Garbage bytes — plistlib raises; soft-fail to {} so the
+        # rest of the metadata collection can fall through to env
+        # vars instead of taking the whole build down.
+        path = _write_fixture('this is not a plist at all')
+        try:
+            result = agent._read_info_plist(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(result, {})
+
+
+# ──────────────────────────────────────────────
+# _find_first_above
+# ──────────────────────────────────────────────
+
+class TestFindFirstAbove(unittest.TestCase):
+    def test_returns_none_on_empty_start(self):
+        # Empty / None start_dir is the "called outside Xcode"
+        # case — return None so the orchestrator skips the source.
+        self.assertIsNone(agent._find_first_above(None, 'Podfile.lock'))
+        self.assertIsNone(agent._find_first_above('', 'Podfile.lock'))
+
+    def test_finds_file_at_start_dir(self):
+        # Project-root-style layout: the lockfile sits right next
+        # to the .xcodeproj. Walk MUST find it without climbing.
+        with tempfile.TemporaryDirectory() as root:
+            target = os.path.join(root, 'Podfile.lock')
+            with open(target, 'w') as f:
+                f.write('placeholder')
+            found = agent._find_first_above(root, 'Podfile.lock')
+            # Must be the absolute path. realpath normalises macOS's
+            # /private/tmp <-> /tmp symlink so the comparison
+            # doesn't depend on which side of the symlink each
+            # branch resolved through.
+            self.assertEqual(os.path.realpath(found),
+                             os.path.realpath(target))
+
+    def test_walks_up_to_find_file(self):
+        # Realistic layout: the Xcode build phase runs from
+        # `<root>/build/Debug-iphonesimulator/MyApp.app/` and the
+        # lockfile is 3 levels above. Walk must climb to find it.
+        with tempfile.TemporaryDirectory() as root:
+            deep = os.path.join(root, 'a', 'b', 'c')
+            os.makedirs(deep)
+            target = os.path.join(root, 'Podfile.lock')
+            with open(target, 'w') as f:
+                f.write('placeholder')
+            found = agent._find_first_above(deep, 'Podfile.lock')
+            self.assertEqual(os.path.realpath(found),
+                             os.path.realpath(target))
+
+    def test_max_levels_cap_prevents_unbounded_climb(self):
+        # The cap defends against a misconfigured start_dir that
+        # would otherwise walk to filesystem root. Set the cap to
+        # 2 and place the target 4 levels up — must NOT find it.
+        with tempfile.TemporaryDirectory() as root:
+            deep = os.path.join(root, 'a', 'b', 'c', 'd')
+            os.makedirs(deep)
+            target = os.path.join(root, 'Podfile.lock')
+            with open(target, 'w') as f:
+                f.write('placeholder')
+            found = agent._find_first_above(deep, 'Podfile.lock',
+                                             max_levels=2)
+            self.assertIsNone(found)
+
+    def test_returns_none_when_file_not_present_anywhere(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertIsNone(agent._find_first_above(root, 'NoSuch.file'))
+
+    def test_finds_nested_path_form(self):
+        # Xcode-managed SPM stashes Package.resolved under
+        # `<root>/MyApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
+        # and the orchestrator passes a relative subpath like
+        # `xcshareddata/swiftpm/Package.resolved` to _find_first_above.
+        # The walk must respect the relative path verbatim.
+        with tempfile.TemporaryDirectory() as root:
+            nested = os.path.join(root, 'xcshareddata', 'swiftpm')
+            os.makedirs(nested)
+            target = os.path.join(nested, 'Package.resolved')
+            with open(target, 'w') as f:
+                f.write('{}')
+            found = agent._find_first_above(
+                root,
+                os.path.join('xcshareddata', 'swiftpm', 'Package.resolved'),
+            )
+            self.assertEqual(os.path.realpath(found),
+                             os.path.realpath(target))
+
+
+# ──────────────────────────────────────────────
+# _resolve_product_binary_path
+# ──────────────────────────────────────────────
+
+class TestResolveProductBinaryPath(unittest.TestCase):
+    def setUp(self):
+        # The helper falls through to `options.build_dir` when the
+        # TARGET_BUILD_DIR env var is unset. Inject a default so the
+        # tests can exercise both branches without NameError.
+        self._prev = _install_options(agent, build_dir=None)
+
+    def tearDown(self):
+        _restore_options(agent, self._prev)
+
+    def test_returns_none_when_both_env_and_options_unset(self):
+        # No TARGET_BUILD_DIR and no options.build_dir → can't
+        # construct a binary path → return None and let the
+        # orchestrator skip the vendored-framework scan.
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(agent._resolve_product_binary_path())
+
+    def test_returns_none_when_executable_path_env_missing(self):
+        # TARGET_BUILD_DIR set but EXECUTABLE_PATH not — without
+        # the Mach-O leaf there's nothing to scan.
+        with tempfile.TemporaryDirectory() as build_dir, \
+                mock.patch.dict(os.environ,
+                                {'TARGET_BUILD_DIR': build_dir},
+                                clear=True):
+            self.assertIsNone(agent._resolve_product_binary_path())
+
+    def test_returns_none_when_resolved_path_does_not_exist(self):
+        # Env vars set but the joined path doesn't exist on disk —
+        # the linker hasn't produced the binary yet (or the path
+        # is stale). Soft-fail.
+        with tempfile.TemporaryDirectory() as build_dir, \
+                mock.patch.dict(os.environ, {
+                    'TARGET_BUILD_DIR':  build_dir,
+                    'EXECUTABLE_PATH':   'MyApp.app/MyApp',
+                }, clear=True):
+            self.assertIsNone(agent._resolve_product_binary_path())
+
+    def test_returns_path_when_binary_exists(self):
+        with tempfile.TemporaryDirectory() as build_dir:
+            app = os.path.join(build_dir, 'MyApp.app')
+            os.makedirs(app)
+            binary = os.path.join(app, 'MyApp')
+            with open(binary, 'wb') as f:
+                f.write(b'\xcf\xfa\xed\xfe')  # 64-bit Mach-O magic
+            with mock.patch.dict(os.environ, {
+                'TARGET_BUILD_DIR':  build_dir,
+                'EXECUTABLE_PATH':   'MyApp.app/MyApp',
+            }, clear=True):
+                result = agent._resolve_product_binary_path()
+            self.assertEqual(os.path.realpath(result),
+                             os.path.realpath(binary))
+
+
+# ──────────────────────────────────────────────
+# _extract_first_dwarf_uuid
+# ──────────────────────────────────────────────
+
+class TestExtractFirstDwarfUuid(unittest.TestCase):
+    def setUp(self):
+        self._prev = _install_options(agent, dsym_folder=None)
+
+    def tearDown(self):
+        _restore_options(agent, self._prev)
+
+    def test_returns_none_when_dsym_folder_unset(self):
+        # options.dsym_folder is None by default → short-circuit.
+        self.assertIsNone(agent._extract_first_dwarf_uuid())
+
+    def test_returns_none_when_folder_has_no_dsym(self):
+        with tempfile.TemporaryDirectory() as folder:
+            agent.options.dsym_folder = folder
+            self.assertIsNone(agent._extract_first_dwarf_uuid())
+
+    def test_returns_first_uuid_when_dsym_found(self):
+        # Build a realistic dSYM tree:
+        #   <folder>/MyApp.app.dSYM/Contents/Resources/DWARF/MyApp
+        # Mock parseDSYM so we don't actually shell out to
+        # dwarfdump — and so the test stays hermetic.
+        with tempfile.TemporaryDirectory() as folder:
+            dwarf = os.path.join(folder, 'MyApp.app.dSYM', 'Contents',
+                                 'Resources', 'DWARF')
+            os.makedirs(dwarf)
+            binary = os.path.join(dwarf, 'MyApp')
+            with open(binary, 'wb') as f:
+                f.write(b'\xcf\xfa\xed\xfe' + b'\x00' * 32)
+            agent.options.dsym_folder = folder
+            with mock.patch.object(agent, 'parseDSYM',
+                                   return_value=['ABCDEF12-3456-7890-ABCD-EF1234567890']):
+                uuid = agent._extract_first_dwarf_uuid()
+            self.assertEqual(uuid, 'ABCDEF12-3456-7890-ABCD-EF1234567890')
+
+    def test_skips_empty_and_symlink_dwarf_files(self):
+        # Zero-byte file (linker placeholder) AND a symlink — both
+        # must be skipped before parseDSYM is even called.
+        with tempfile.TemporaryDirectory() as folder:
+            dwarf = os.path.join(folder, 'MyApp.app.dSYM', 'Contents',
+                                 'Resources', 'DWARF')
+            os.makedirs(dwarf)
+            empty = os.path.join(dwarf, 'Empty')
+            open(empty, 'wb').close()  # 0 bytes
+            agent.options.dsym_folder = folder
+            with mock.patch.object(agent, 'parseDSYM') as parseDSYM_mock:
+                parseDSYM_mock.return_value = ['SHOULD-NOT-SURFACE']
+                uuid = agent._extract_first_dwarf_uuid()
+            # parseDSYM was never called → no candidate found → None.
+            self.assertEqual(parseDSYM_mock.call_count, 0)
+            self.assertIsNone(uuid)
+
+
+# ──────────────────────────────────────────────
+# _collect_build_metadata
+# ──────────────────────────────────────────────
+
+class TestCollectBuildMetadata(unittest.TestCase):
+    def setUp(self):
+        self._prev = _install_options(agent, build_dir=None,
+                                       version=None, build=None)
+
+    def tearDown(self):
+        _restore_options(agent, self._prev)
+
+    def _make_plist(self, body):
+        import plistlib
+        fd, path = tempfile.mkstemp(suffix='.plist')
+        with os.fdopen(fd, 'wb') as f:
+            plistlib.dump(body, f)
+        return path
+
+    def test_reads_fields_from_info_plist_when_present(self):
+        # Plist values take precedence over env-var fallbacks.
+        plist = self._make_plist({
+            'CFBundleShortVersionString': '1.2.3',
+            'CFBundleVersion':            '42',
+            'CFBundleIdentifier':         'com.example.app',
+        })
+        try:
+            with tempfile.TemporaryDirectory() as build_dir, \
+                    mock.patch.dict(os.environ, {
+                        'TARGET_BUILD_DIR':            build_dir,
+                        'INFOPLIST_PATH':              os.path.relpath(plist, build_dir),
+                        # Env-var values DIFFERENT from the plist
+                        # values to pin precedence: plist wins.
+                        'MARKETING_VERSION':           'env-version',
+                        'CURRENT_PROJECT_VERSION':     'env-build',
+                        'PRODUCT_BUNDLE_IDENTIFIER':   'env.pkg',
+                        'CONFIGURATION':               'Release',
+                        'XCODE_VERSION_ACTUAL':        '1530',
+                    }, clear=True):
+                body = agent._collect_build_metadata()
+            self.assertEqual(body['version'],     '1.2.3')
+            self.assertEqual(body['build'],       '42')
+            self.assertEqual(body['package_id'],  'com.example.app')
+        finally:
+            os.unlink(plist)
+
+    def test_falls_back_to_env_vars_when_plist_missing_fields(self):
+        # Plist absent → env vars carry the values. The fallback
+        # chain (plist > env > options) is documented; pin every
+        # link by exercising the case where only the middle link
+        # has values.
+        with mock.patch.dict(os.environ, {
+            'MARKETING_VERSION':           '9.8.7',
+            'CURRENT_PROJECT_VERSION':     '1024',
+            'PRODUCT_BUNDLE_IDENTIFIER':   'com.example.fromenv',
+            'CONFIGURATION':               'Debug',
+        }, clear=True):
+            body = agent._collect_build_metadata()
+        self.assertEqual(body['version'],    '9.8.7')
+        self.assertEqual(body['build'],      '1024')
+        self.assertEqual(body['package_id'], 'com.example.fromenv')
+
+    def test_falls_back_to_options_when_env_and_plist_missing(self):
+        # CLI invocation case: BugseeAgent is run from the command
+        # line with --version/--build, no Xcode env. The options
+        # namespace MUST be the last-resort fallback for both.
+        agent.options.version = 'cli-version'
+        agent.options.build   = 'cli-build'
+        with mock.patch.dict(os.environ, {}, clear=True):
+            body = agent._collect_build_metadata()
+        self.assertEqual(body['version'], 'cli-version')
+        self.assertEqual(body['build'],   'cli-build')
+
+    def test_emits_iso_contract_fields(self):
+        # The wire contract with the appserver requires these
+        # fields to be present at fixed shapes regardless of
+        # which fallbacks fired:
+        #   - format == 'ipa' (worker's ALLOWED_BUILD_FORMATS gate)
+        #   - has_mapping == False (iOS has no Java mapping)
+        #   - build_metadata.build_system.type == 'xcode'
+        #   - build_metadata.agent.name == 'BugseeAgent'
+        with mock.patch.dict(os.environ, {}, clear=True):
+            body = agent._collect_build_metadata()
+        self.assertEqual(body['format'],      'ipa')
+        self.assertEqual(body['has_mapping'], False)
+        self.assertEqual(body['uuid'], None)  # filled in by caller
+        self.assertEqual(body['build_metadata']['build_system']['type'],
+                         'xcode')
+        self.assertEqual(body['build_metadata']['agent']['name'],
+                         'BugseeAgent')
+
+
+# ──────────────────────────────────────────────
+# _collect_all_dependencies
+# ──────────────────────────────────────────────
+
+class TestCollectAllDependencies(unittest.TestCase):
+    def setUp(self):
+        self._prev = _install_options(agent, build_dir=None)
+
+    def tearDown(self):
+        _restore_options(agent, self._prev)
+
+    def test_returns_empty_when_no_lockfiles_anywhere(self):
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {}, clear=True):
+            merged, scope, truncated = agent._collect_all_dependencies(root)
+        self.assertEqual(merged, [])
+        self.assertFalse(truncated)
+        # Scope label is the worker's compatibility token — pin it
+        # so the iOS side and Android side stay diff-comparable
+        # across the same build's records.
+        self.assertEqual(scope, 'all')
+
+    def test_aggregates_pods_spm_and_carthage_when_all_present(self):
+        # Project root layout:
+        #   root/Podfile.lock       — 1 entry
+        #   root/Package.resolved   — 1 entry
+        #   root/Cartfile.resolved  — 1 entry
+        # The merged result must surface all three.
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {}, clear=True):
+            with open(os.path.join(root, 'Podfile.lock'), 'w') as f:
+                f.write(textwrap.dedent("""\
+                    PODS:
+                      - SocketRocket (0.7.1)
+
+                    DEPENDENCIES:
+                      - SocketRocket
+
+                    SPEC CHECKSUMS:
+                      SocketRocket: feedface
+                """))
+            with open(os.path.join(root, 'Package.resolved'), 'w') as f:
+                f.write(json.dumps({
+                    "pins": [{
+                        "identity": "alamofire",
+                        "kind": "remoteSourceControl",
+                        "location": "https://github.com/Alamofire/Alamofire.git",
+                        "state": {"version": "5.8.1"},
+                    }],
+                    "version": 2,
+                }))
+            with open(os.path.join(root, 'Cartfile.resolved'), 'w') as f:
+                f.write('github "ReactiveCocoa/ReactiveCocoa" "v2.3.1"\n')
+            merged, scope, truncated = agent._collect_all_dependencies(root)
+        names = {e['name'] for e in merged}
+        self.assertIn('SocketRocket', names)
+        self.assertIn('alamofire', names)
+        self.assertIn('ReactiveCocoa/ReactiveCocoa', names)
+        self.assertFalse(truncated)
+
+    def test_finds_xcode_managed_spm_via_nested_path(self):
+        # When Package.resolved isn't at the project root, the
+        # orchestrator looks for the Xcode-managed variant under
+        # xcshareddata/swiftpm/. Verify that path lights up.
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, {}, clear=True):
+            nested = os.path.join(root, 'xcshareddata', 'swiftpm')
+            os.makedirs(nested)
+            with open(os.path.join(nested, 'Package.resolved'), 'w') as f:
+                f.write(json.dumps({
+                    "pins": [{
+                        "identity": "swift-collections",
+                        "kind": "remoteSourceControl",
+                        "location": "https://github.com/apple/swift-collections.git",
+                        "state": {"version": "1.1.0"},
+                    }],
+                    "version": 2,
+                }))
+            merged, _scope, _truncated = agent._collect_all_dependencies(root)
+        names = {e['name'] for e in merged}
+        self.assertIn('swift-collections', names)
+
+
 if __name__ == '__main__':
     unittest.main()
