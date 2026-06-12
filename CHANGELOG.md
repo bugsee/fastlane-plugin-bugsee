@@ -121,6 +121,22 @@ the contract.
   (`POST /v2/apps/<token>/builds`) is the planned path back —
   tracked separately from this release.
 
+### Scope clarification: Android mapping upload
+
+The plugin remains iOS-only by design. Android mapping (ProGuard /
+R8) upload stays with the
+[Bugsee Android Gradle plugin](https://github.com/bugsee/bugsee-android-gradle-plugin),
+not a parallel fastlane action — because the Bugsee Android SDK
+learns the build UUID from channels only the Gradle plugin can
+populate (post-R8 asset file + manifest meta-data fallback). A
+fastlane-only mapping upload would land on the server but the SDK's
+crash reports would carry no matching UUID, so symbolication would
+never resolve.
+
+A README section now points searchers in that direction so they
+don't bounce off the plugin assuming Android isn't supported by
+Bugsee at all.
+
 ## 1.0.4
 
 See git history for details on earlier releases.

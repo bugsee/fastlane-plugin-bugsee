@@ -68,6 +68,17 @@ The emitted blob is wire-compatible with the Bugsee Android Gradle plugin's `Dep
 
 No configuration is required — if a lockfile exists, it's collected.
 
+## Android symbols / mapping files
+
+This plugin is **iOS-only**. Android mapping (ProGuard / R8) upload is handled by the [Bugsee Android Gradle plugin](https://github.com/bugsee/bugsee-android-gradle-plugin), not by a fastlane action.
+
+The Gradle plugin is the canonical path for two reasons:
+
+1. **The Bugsee Android SDK reads the build UUID from channels only the Gradle plugin can populate** — an asset file injected post-R8, and a manifest meta-data fallback. By the time fastlane runs, the APK is already built and signed; neither channel can be written retroactively. A fastlane-only upload would land on the server but the SDK's crash reports would carry no matching UUID, and symbolication would never resolve.
+2. **The Gradle plugin already shells out to `bugsee-cli`** for the actual upload — the same Rust binary this fastlane plugin uses for iOS dSYMs. One upload mechanism, one wire format across both platforms.
+
+If you're using `fastlane` for Android release orchestration (`gradle`, `supply`, etc.), add the Bugsee Android Gradle plugin to your `build.gradle.kts` and let the standard `bugseeMappingUpload<Variant>` task run as part of your gradle build — fastlane invokes it for free as part of the existing `gradle` action.
+
 ## Documentation
 
 Further documentation about Bugsee crash symbolication is available at https://docs.bugsee.com
