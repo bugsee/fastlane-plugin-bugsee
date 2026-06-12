@@ -777,17 +777,51 @@ def _local_hostname():
         return None
 
 
+def _resolve_machine_label_via_cli():
+    """Shell to `bugsee-cli build-env machine-label` and return the
+    trimmed stdout. Option-C target."""
+    cli_path_opt = None
+    cli_version_opt = None
+    try:
+        cli_path_opt = getattr(options, 'cli_path', None)
+        cli_version_opt = getattr(options, 'cli_version', None)
+    except NameError:
+        pass
+    cli = resolveCli(cli_path_opt, cli_version_opt)
+    if not cli:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, "build-env", "machine-label"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        return out if out else None
+    except OSError:
+        return None
+
+
 def resolve_machine_label():
     """Returns a `<provider>[:<detail>]` label describing where the
     build ran — mirrors the cascade in the Android plugin's
     `BuildMachineResolver` so the front-end can group iOS + Android
-    builds from the same CI runner. Pure env-based detection; no
+    builds from the same CI runner.
+
+    Prefers `bugsee-cli build-env machine-label` (single cross-
+    language source of truth). Falls back to the in-process
+    Python implementation below — pure env-based detection; no
     shelling out.
 
     First positive provider signal wins. Falls back to the local
     hostname when nothing matches AND hostname lookup succeeds.
     Returns None as last resort (sandboxed / networkless hosts).
     """
+    via_cli = _resolve_machine_label_via_cli()
+    if via_cli is not None:
+        return via_cli
+
     env = os.environ
 
     def with_detail(prefix, detail):
@@ -996,11 +1030,50 @@ def resolve_vcs_metadata(working_dir):
     return _resolve_git_fallback(working_dir)
 
 
+def _resolve_xcode_version_via_cli():
+    """Shell to `bugsee-cli build-env xcode-version` and return the
+    trimmed stdout. Option-C migration target — the Rust CLI owns
+    the canonical resolver. Returns None on CLI absence /
+    non-zero exit / empty output (the Python fallback below
+    handles those cases)."""
+    cli_path_opt = None
+    cli_version_opt = None
+    try:
+        cli_path_opt = getattr(options, 'cli_path', None)
+        cli_version_opt = getattr(options, 'cli_version', None)
+    except NameError:
+        pass
+    cli = resolveCli(cli_path_opt, cli_version_opt)
+    if not cli:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, "build-env", "xcode-version"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        return out if out else None
+    except OSError:
+        return None
+
+
 def resolve_xcode_version():
     """Returns the short Xcode version (e.g. `"16.2"`) or None. Tries
     `$XCODE_VERSION_ACTUAL` first (set in every Run Script env —
     numeric like `1620`, needs reformatting), then falls back to
-    `xcodebuild -version` which is slow but ground-truth."""
+    `xcodebuild -version` which is slow but ground-truth.
+
+    Prefers `bugsee-cli build-env xcode-version` when available
+    (single cross-language source of truth, ported from this
+    Python implementation — see `bugsee-cli/src/cli/build_env.rs`).
+    Falls back to the in-process Python below when the CLI isn't
+    installed."""
+    via_cli = _resolve_xcode_version_via_cli()
+    if via_cli is not None:
+        return via_cli
+
     actual = os.environ.get('XCODE_VERSION_ACTUAL')
     if actual and actual.isdigit():
         # "1620" → "16.2.0" ; "1543" → "15.4.3"
@@ -1027,10 +1100,48 @@ def resolve_xcode_version():
 # Xcode env + Info.plist helpers
 # ──────────────────────────────────────────────────────────────────
 
+def _read_info_plist_via_cli(plist_path):
+    """Shell to `bugsee-cli build-env read-plist <path>` and parse
+    the JSON. Option-C migration target."""
+    if not plist_path:
+        return None
+    cli_path_opt = None
+    cli_version_opt = None
+    try:
+        cli_path_opt = getattr(options, 'cli_path', None)
+        cli_version_opt = getattr(options, 'cli_version', None)
+    except NameError:
+        pass
+    cli = resolveCli(cli_path_opt, cli_version_opt)
+    if not cli:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, "build-env", "read-plist", plist_path],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        if not out:
+            return None
+        return json.loads(out)
+    except (OSError, ValueError):
+        return None
+
+
 def _read_info_plist(plist_path):
     """Read the binary or XML Info.plist at the given path. Returns
     a dict on success or `{}` on any error — the caller treats
-    missing fields as best-effort and falls back to env vars."""
+    missing fields as best-effort and falls back to env vars.
+
+    Prefers `bugsee-cli build-env read-plist` when available
+    (single cross-language source of truth). Falls back to the
+    in-process `plistlib.load` below."""
+    via_cli = _read_info_plist_via_cli(plist_path)
+    if via_cli is not None:
+        return via_cli
+
     if not plist_path or not os.path.isfile(plist_path):
         return {}
     try:

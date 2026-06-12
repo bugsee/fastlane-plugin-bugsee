@@ -1803,11 +1803,18 @@ class TestResolveXcodeVersion(unittest.TestCase):
         # Env var unset → resolver shells out to xcodebuild. Mock
         # subprocess to a canonical "Xcode 16.0\nBuild version 16A242d"
         # response and pin the parsed major.minor form.
+        #
+        # NB: the production resolver also tries `bugsee-cli build-env
+        # xcode-version` first; we skip that path here by mocking
+        # resolveCli to return None so the Python xcodebuild
+        # fallback gets exercised. The CLI path has its own tests
+        # in TestResolveXcodeVersionViaCli (TBD) / on the Rust side.
         canned = SimpleNamespace(
             returncode=0,
             stdout="Xcode 16.0\nBuild version 16A242d\n",
         )
         with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(agent, 'resolveCli', return_value=None), \
                 mock.patch('subprocess.run', return_value=canned):
             self.assertEqual(agent.resolve_xcode_version(), '16.0')
 
@@ -1817,6 +1824,7 @@ class TestResolveXcodeVersion(unittest.TestCase):
         # surfacing a garbled value.
         canned = SimpleNamespace(returncode=1, stdout='', stderr='nope')
         with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(agent, 'resolveCli', return_value=None), \
                 mock.patch('subprocess.run', return_value=canned):
             self.assertIsNone(agent.resolve_xcode_version())
 
@@ -1824,6 +1832,7 @@ class TestResolveXcodeVersion(unittest.TestCase):
         # FileNotFoundError on stripped-down CI images without
         # Xcode installed.
         with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(agent, 'resolveCli', return_value=None), \
                 mock.patch('subprocess.run',
                            side_effect=FileNotFoundError("xcodebuild")):
             self.assertIsNone(agent.resolve_xcode_version())
@@ -1832,12 +1841,15 @@ class TestResolveXcodeVersion(unittest.TestCase):
         # Defensive: if Xcode ever exports a dotted form directly
         # (`16.2.0`), the `.isdigit()` guard must short-circuit
         # the numeric reformat and fall through to xcodebuild.
+        # Same as above — mock the CLI path to None to exercise
+        # the Python fallback specifically.
         canned = SimpleNamespace(
             returncode=0, stdout="Xcode 16.2.0\n",
         )
         with mock.patch.dict(os.environ,
                              {'XCODE_VERSION_ACTUAL': '16.2.0'},
                              clear=True), \
+                mock.patch.object(agent, 'resolveCli', return_value=None), \
                 mock.patch('subprocess.run', return_value=canned):
             self.assertEqual(agent.resolve_xcode_version(), '16.2.0')
 
@@ -2189,6 +2201,167 @@ class TestFindLatestXcactivitylog(unittest.TestCase):
             os.makedirs(objroot)
             picked = agent._find_latest_xcactivitylog(objroot)
             self.assertEqual(os.path.basename(picked), 'ZZZZ.xcactivitylog')
+
+
+class TestBuildEnvViaCli(unittest.TestCase):
+    """Pins the Option-C migration of three build-env helpers
+    (xcode-version, machine-label, _read_info_plist) to the
+    `bugsee-cli build-env` subcommands. Same migration pattern
+    the VCS resolver and iOS deps parsers landed first — the CLI
+    is the canonical implementation; each helper falls back to
+    its in-process Python implementation only when the CLI isn't
+    available."""
+
+    def _stub_run(self, returncode=0, stdout=''):
+        return SimpleNamespace(returncode=returncode, stdout=stdout)
+
+    # ── xcode-version ────────────────────────────────────────────
+
+    def test_xcode_version_uses_cli_output_when_available(self):
+        # CLI returns "16.2.0" → that's used directly. Python
+        # fallback (which would parse XCODE_VERSION_ACTUAL or
+        # shell to xcodebuild) MUST NOT fire.
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/path/to/bugsee-cli') as cli_mock, \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout='16.2.0\n')) as run_mock:
+            self.assertEqual(agent.resolve_xcode_version(), '16.2.0')
+        cli_mock.assert_called_once()
+        run_mock.assert_called_once()
+        argv = run_mock.call_args[0][0]
+        self.assertEqual(argv[0], '/path/to/bugsee-cli')
+        self.assertIn('build-env', argv)
+        self.assertIn('xcode-version', argv)
+
+    def test_xcode_version_falls_back_when_cli_unavailable(self):
+        # resolveCli returns None → Python path runs. Verify by
+        # setting XCODE_VERSION_ACTUAL so the Python branch
+        # produces a known value.
+        with mock.patch.dict(os.environ,
+                             {'XCODE_VERSION_ACTUAL': '1620'},
+                             clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value=None), \
+                mock.patch.object(agent.subprocess, 'run') as run_mock:
+            self.assertEqual(agent.resolve_xcode_version(), '16.2.0')
+        # subprocess.run NEVER called — pure Python branch.
+        self.assertEqual(run_mock.call_count, 0)
+
+    def test_xcode_version_falls_back_on_empty_cli_stdout(self):
+        # CLI prints empty (couldn't resolve) → fall back to
+        # Python. The Python branch with XCODE_VERSION_ACTUAL set
+        # produces "16.2.0" verbatim.
+        with mock.patch.dict(os.environ,
+                             {'XCODE_VERSION_ACTUAL': '1620'},
+                             clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout='')):
+            self.assertEqual(agent.resolve_xcode_version(), '16.2.0')
+
+    def test_xcode_version_falls_back_on_nonzero_exit(self):
+        with mock.patch.dict(os.environ,
+                             {'XCODE_VERSION_ACTUAL': '1620'},
+                             clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=2, stdout='')):
+            self.assertEqual(agent.resolve_xcode_version(), '16.2.0')
+
+    # ── machine-label ────────────────────────────────────────────
+
+    def test_machine_label_uses_cli_output_when_available(self):
+        with mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0,
+                                      stdout='github-actions:runner-1\n')) as run_mock:
+            self.assertEqual(agent.resolve_machine_label(),
+                             'github-actions:runner-1')
+        argv = run_mock.call_args[0][0]
+        self.assertIn('machine-label', argv)
+
+    def test_machine_label_falls_back_when_cli_unavailable(self):
+        # CI env makes the Python fallback produce the same
+        # github-actions label, so we can assert on it.
+        with mock.patch.dict(os.environ, {
+            'GITHUB_ACTIONS': 'true',
+            'RUNNER_NAME':    'py-runner',
+        }, clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value=None), \
+                mock.patch.object(agent.subprocess, 'run') as run_mock:
+            self.assertEqual(agent.resolve_machine_label(),
+                             'github-actions:py-runner')
+        self.assertEqual(run_mock.call_count, 0)
+
+    def test_machine_label_falls_back_on_empty_cli_output(self):
+        # CLI prints empty (sandboxed environment with no
+        # hostname AND no CI provider) → fall back to Python.
+        with mock.patch.dict(os.environ, {
+            'GITHUB_ACTIONS': 'true',
+            'RUNNER_NAME':    'py-runner',
+        }, clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout='')):
+            self.assertEqual(agent.resolve_machine_label(),
+                             'github-actions:py-runner')
+
+    # ── read-plist ───────────────────────────────────────────────
+
+    def test_read_plist_uses_cli_output_when_available(self):
+        canned = '{"CFBundleShortVersionString":"1.2.3",' \
+                 '"CFBundleVersion":"42",' \
+                 '"CFBundleIdentifier":"com.example.app"}'
+        with mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout=canned)) as run_mock:
+            result = agent._read_info_plist('/path/to/Info.plist')
+        self.assertEqual(result['CFBundleShortVersionString'], '1.2.3')
+        self.assertEqual(result['CFBundleVersion'], '42')
+        self.assertEqual(result['CFBundleIdentifier'], 'com.example.app')
+        argv = run_mock.call_args[0][0]
+        self.assertIn('read-plist', argv)
+        # The plist path is passed as the positional argument.
+        self.assertEqual(argv[-1], '/path/to/Info.plist')
+
+    def test_read_plist_falls_back_when_cli_unavailable(self):
+        # resolveCli returns None → fall back to in-process
+        # plistlib. Verify by supplying a real XML plist fixture.
+        import plistlib
+        with tempfile.NamedTemporaryFile(
+                suffix='.plist', delete=False) as f:
+            plistlib.dump({'CFBundleVersion': '99'}, f)
+            path = f.name
+        try:
+            with mock.patch.object(agent, 'resolveCli',
+                                      return_value=None), \
+                    mock.patch.object(agent.subprocess, 'run') as run_mock:
+                result = agent._read_info_plist(path)
+            self.assertEqual(result['CFBundleVersion'], '99')
+            self.assertEqual(run_mock.call_count, 0)
+        finally:
+            os.unlink(path)
+
+    def test_read_plist_with_none_path_returns_empty(self):
+        # The early-return guard for None path runs before
+        # resolveCli so the CLI is never invoked.
+        with mock.patch.object(agent, 'resolveCli') as cli_mock:
+            result = agent._read_info_plist(None)
+        self.assertEqual(result, {})
+        self.assertEqual(cli_mock.call_count, 0)
 
 
 if __name__ == '__main__':
