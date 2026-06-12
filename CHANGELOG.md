@@ -74,10 +74,22 @@ diff-compatibility check.
 
 ### Removed
 
-- App icon attachment to dSYM uploads — the legacy curl pipeline
-  posted the app icon alongside the dSYM zip; `bugsee-cli` does
-  not yet accept `--icon` for `--type dsym`. Planned for a later
-  CLI release.
+- App icon attachment to dSYM uploads. The legacy curl pipeline
+  shipped the Xcode-uncrushed launcher PNG inside the dSYM zip,
+  which the worker extracted as `icon.source='build'`. The new
+  per-dSYM `bugsee-cli` upload model has no slot for it
+  (`--icon` is rejected for `--type dsym`), and the two helpers
+  that produced the PNG (`getIcon` / `uncrushIcon`) have been
+  removed from `BugseeAgent`.
+
+  For apps published on the App Store / Google Play, the worker
+  auto-fetches the icon (`icon.source='appstore'`) so the
+  dashboard still renders an icon next to the app. For
+  enterprise / TestFlight / internal builds that aren't on a
+  public store, the dashboard will now render without an icon.
+  Re-wiring icon attachment onto the build-registration body
+  (`POST /v2/apps/<token>/builds`) is the planned path back —
+  tracked separately from this release.
 
 ## 1.0.4
 

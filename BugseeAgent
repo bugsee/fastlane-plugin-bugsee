@@ -1047,43 +1047,29 @@ def deobfuscateDSYM(fullPath, mapsPath):
         return
     return
 
-def getIcon():
-    if not options.from_xcode:
-        # No icon extraction when run outside of XCode
-        # TODO: Get it from fastlane if we run after build?
-        return None
-    try:
-        info_file_path = os.path.join(options.build_dir, os.environ['INFOPLIST_PATH'])
-        info_file_dir = os.path.dirname(info_file_path)
-        # p = subprocess.Popen('/usr/libexec/PlistBuddy -c "Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles" %s' % info_file_path,
-        #                  stdout=subprocess.PIPE, shell=True)
+# Note on app icon attachment (removed in 1.1.0):
+#
+# The legacy upload pipeline shipped the Xcode-uncrushed launcher
+# PNG inside the dSYM zip; the worker's symbols job extracted
+# `icon.png` from the bundle root and called `icons.store_icon(...,
+# 'build', ...)` (see worker/jobs/symbols.py). Two helpers — getIcon
+# and uncrushIcon (running `xcrun pngcrush -revert-iphone-
+# optimizations`) — produced that PNG.
+#
+# bugsee-cli's --type dsym path takes no --icon (the CLI rejects it
+# at parse-time; see bugsee-cli/src/cli/debug_files.rs), so the
+# build-extraction code path is dead. The dashboard falls back to
+# the worker's appstore fetch (icon.source='appstore') for any app
+# that's published on the App Store, but enterprise / TestFlight /
+# internal builds now render without an icon until icon attachment
+# is re-wired into the build registration body
+# (`_request_build_registration` would be the place).
+#
+# The legacy helpers are removed here rather than left as comments
+# because git history preserves them — searching for getIcon /
+# uncrushIcon in the log of this file surfaces the exact 1.0.4
+# implementation if someone needs to re-introduce it.
 
-        # stdout, stderr = p.communicate()
-        # icons = stdout.split()
-        # if len(icons) > 4:
-        #     return icons[2:-1]
-        icons = [   
-                    '114x114',
-                    '120x120', 'AppIcon60x60@2x', 'AppIcon40x40@3x',
-                    '144x144',
-                    '180x180', 'AppIcon60x60@3x',
-                    '87x87', 'AppIcon29x29@3x',
-                    '80x80', 'AppIcon40x40@2x',
-                    '72x72',
-                    '58x58', 'AppIcon29x29@2x',
-                    '57x57',
-                    '29x29'
-                ]
-
-        for icon in icons:
-            path = os.path.join(info_file_dir, icon + '.png')
-            if os.path.isfile(path):
-                return path
-
-    except Exception as error:
-        return None
-
-    return None
 
 def getVersionAndBuild(zipFile):
     version = None
@@ -1104,19 +1090,6 @@ def getVersionAndBuild(zipFile):
             return (None, None)
 
     return (version, build)
-
-def uncrushIcon(icon, tempDir):
-    try:
-        dest = os.path.join(tempDir, 'icon.png')
-        print("Uncrushing Icon PNG file to %s" % dest)
-        cmd = '/usr/bin/xcrun pngcrush -revert-iphone-optimizations "'+ icon + '" "' + dest + '"'
-        p = subprocess.Popen([cmd], stdout=subprocess.PIPE, shell=True)
-
-        stdout, stderr = p.communicate()
-    except Exception as error:
-        return None
-
-    return dest
 
 def requestEndPoint(version, build):
     encoded_data = json.dumps({
