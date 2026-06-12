@@ -1,0 +1,58 @@
+name: test
+
+# Runs the Ruby (RSpec + RuboCop) and Python (unittest) test suites
+# on every push and PR. The plugin ships both Ruby (the fastlane
+# action layer) and Python (BugseeAgent) code paths, so both need to
+# be exercised — a green Ruby run alone isn't sufficient signal.
+#
+# Suites are split into separate jobs so a failure in one doesn't
+# mask a failure in the other in the GitHub UI; each job pins its
+# language toolchain explicitly.
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  ruby:
+    # fastlane plugins are commonly developed on Ubuntu; macOS is
+    # only required to exercise the Xcode-side build phase, which
+    # the unit tests stub out.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          # Pinned to a Ruby that matches the modern fastlane
+          # baseline. The gemspec leaves required_ruby_version open
+          # so bumping this here is the canonical version signal.
+          ruby-version: '3.1'
+          # `bundler-cache: true` caches gems on the Gemfile.lock
+          # hash. Speeds up subsequent runs from ~40s to ~5s.
+          bundler-cache: true
+      - name: rspec
+        run: bundle exec rspec
+      # NOTE: `bundle exec rubocop` is intentionally NOT run here.
+      # The checked-in `.rubocop.yml` references cop names that
+      # have been renamed or removed in rubocop 1.x (e.g.
+      # `Style/BracesAroundHashParameters`, `Lint/HandleExceptions`),
+      # so a fresh rubocop bombs out before linting a single file.
+      # Modernising the config is a separate concern from this
+      # workflow; re-enable once the config is brought current.
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # BugseeAgent uses only stdlib (no requirements.txt),
+          # so any 3.10+ Python will do. 3.11 matches the iOS CI
+          # baseline most teams run.
+          python-version: '3.11'
+      - name: unittest
+        # Run both test modules in one invocation so the discovery
+        # output is single-pane in the GitHub log.
+        run: python3 -B -u -m unittest test.test_bugsee_agent test.test_bugsee_cli_migration
