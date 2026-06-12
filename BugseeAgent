@@ -27,9 +27,12 @@ import re
 import json
 import hashlib
 import shutil
+import gzip
+import plistlib
+import time
+import platform
 from optparse import OptionParser
 import fnmatch
-import platform
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -43,6 +46,10 @@ import platform
 # Override via --cli-path (developer-local binary) or --cli-version
 # (test a newer release). Environment fallbacks: BUGSEE_CLI_PATH,
 # BUGSEE_CLI_VERSION.
+#
+# Build-info / dependency collection (the rest of this file below)
+# is still done in Python here. That migration is deferred to the
+# cross-platform build-info contributor SPI.
 # ──────────────────────────────────────────────────────────────────
 
 BUGSEE_CLI_DEFAULT_VERSION = "0.1.1"
@@ -177,6 +184,824 @@ def uploadDsymViaCli(cliBinary, dsymPath, appToken, endpoint, version, build):
     except Exception as e:
         print("Bugsee: failed to exec bugsee-cli at %s: %s" % (cliBinary, e))
         return False
+
+
+# ──────────────────────────────────────────────────────────────────
+# Build dependencies collection (parallel to the Android Gradle
+# plugin's `DependencyCollector` — wire format must stay in lockstep
+# with `BugseeBuildDependenciesPipelineRecipe` consumed by the
+# Bugsee worker / appserver / viewer stack).
+#
+# Sources scanned, in order:
+#   1. CocoaPods         — Podfile.lock (full resolved tree with
+#                          parent → child edges)
+#   2. Swift Package Mgr — Package.resolved (flat list, no graph)
+#   3. Carthage          — Cartfile.resolved (flat list, no graph)
+#   4. Vendored frames   — `otool -L` on the linked product binary,
+#                          filtered to @rpath / @executable_path
+#                          entries (system frameworks excluded)
+#
+# Output: same shape the Android plugin emits — a JSON dictionary
+# carrying `schema_version: 1` and a `dependencies` array of
+# objects with keys: `id`, `group`, `name`, `version`, `direct`,
+# `scope`, `type`, `parents`. iOS-specific mapping notes:
+#
+#   - `group` is the empty string for every source iOS deps come
+#     from (Pods / SPM packages / Carthage / vendored frameworks
+#     don't carry the Maven group:name:version triple).
+#   - `id` is `"<type>:<group>:<name>"` — three colons total for
+#     iOS rows because `group` is empty, matching the format the
+#     viewer's identityOf and the worker's _identity functions
+#     produce. Subspecs (e.g. "Braintree/Card") keep the slash
+#     in `name`.
+#   - `type` is one of `library` (Pods + SPM + Carthage) or
+#     `file` (vendored frameworks discovered via otool). No
+#     `project` rows from iOS for now — local SPM packages are
+#     emitted as library-type with the package name; the path
+#     distinction isn't surfaced.
+#   - `scope` is left unset by default. CocoaPods has a
+#     `:configuration` qualifier on `pod` directives but that's a
+#     Podfile-time concept the lockfile doesn't surface.
+# ──────────────────────────────────────────────────────────────────
+
+# Wire-format schema version. Must equal the Android plugin's
+# `DependencyPayloadSerializer.SCHEMA_VERSION` and be in the worker's
+# `_SUPPORTED_SCHEMA_VERSIONS` set; any bump on either side requires
+# a parallel bump here.
+DEPENDENCIES_SCHEMA_VERSION = 1
+
+# Maximum number of entries we keep before truncating — same cap
+# the Android plugin uses (5000). The summary's `truncated` flag
+# surfaces when the cap kicks in, and the worker uses it to gate
+# diffability (truncated builds can't be diffed against each
+# other since the lists aren't apples-to-apples).
+DEPENDENCIES_MAX_COUNT = 5000
+
+
+def _make_dep_id(dep_type, group, name):
+    """Canonical identity string `"<type>:<group>:<name>"`. The
+    triple must stay byte-for-byte identical with the Android
+    plugin's `DependencyEntry.makeId` and the worker's
+    `_make_identity` so cross-platform diff matching works."""
+    return "%s:%s:%s" % (dep_type, group, name)
+
+
+def _strip_pod_version_paren(s):
+    """Strip the ` (version)` or ` (~> constraint)` suffix from a
+    CocoaPods reference. Returns just the bare name, e.g.
+    `"Braintree/Card (= 5.26.0)"` -> `"Braintree/Card"`.
+    Used for both DEPENDENCIES section entries and child references
+    inside the PODS section — both wear the same version-paren
+    suffix and we always want the underlying name as the lookup key.
+    """
+    paren_pos = s.find('(')
+    if paren_pos == -1:
+        return s.strip()
+    return s[:paren_pos].strip()
+
+
+def _parse_podfile_lock(path):
+    """Parse a CocoaPods `Podfile.lock` and return a list of dep
+    entries with parent edges.
+
+    Strategy:
+      1. Walk the PODS: section line-by-line tracking indent depth.
+         A 2-space-indent line is a top-level pod declaration of
+         shape `- Name (Version):` (the trailing colon is optional —
+         pods with no transitive children skip the colon).
+         A 4-space-indent line is a child of the last top-level pod
+         seen, of shape `- Name [(constraint)]`.
+      2. Walk the DEPENDENCIES: section in the same indent style,
+         collecting the bare name (no constraint) of every entry
+         the user declared directly in their Podfile.
+      3. Emit one entry per top-level pod. `direct` is true iff
+         the pod (or a subspec whose base name matches) appears in
+         the DEPENDENCIES set. `parents` is the list of `id`s of
+         pods that referenced this one as a child — built by
+         reverse-walking the children map.
+
+    The format is YAML-ish but we don't pull in PyYAML — single-file
+    distribution constraint, and the lockfile shape is rigid enough
+    that a hand-rolled parser is robust.
+    """
+    if not path or not os.path.isfile(path):
+        return []
+
+    with open(path, 'r', encoding='utf-8') as f:
+        lines = f.read().splitlines()
+
+    # Split into sections by the top-level uppercase headers
+    # `PODS:`, `DEPENDENCIES:`, `SPEC REPOS:`, etc. Section start is
+    # a line at column 0 ending in ':' (we ignore everything past
+    # the PODS / DEPENDENCIES sections — SPEC CHECKSUMS, etc.).
+    pods_lines = []
+    deps_lines = []
+    current = None
+    for line in lines:
+        if re.match(r'^[A-Z][A-Z _]+:\s*$', line):
+            header = line.rstrip(': ').strip()
+            if header == 'PODS':
+                current = pods_lines
+            elif header == 'DEPENDENCIES':
+                current = deps_lines
+            else:
+                current = None
+            continue
+        if current is not None:
+            current.append(line)
+
+    # PODS section parse: top-level pods and their immediate
+    # children. We don't recurse — CocoaPods's lockfile is flat
+    # past depth 2 (children are pod refs, not nested declarations).
+    pods = {}          # name -> {"version": str, "children": [str]}
+    current_pod = None
+    pod_line_re = re.compile(r'^  - (.+?)(?::?)$')
+    child_line_re = re.compile(r'^    - (.+?)$')
+    name_version_re = re.compile(r'^(.+?)\s+\(([^)]+)\)\s*$')
+    for line in pods_lines:
+        if not line.strip():
+            continue
+        m = child_line_re.match(line)
+        if m and current_pod is not None:
+            child_ref = _strip_pod_version_paren(m.group(1))
+            pods[current_pod]["children"].append(child_ref)
+            continue
+        m = pod_line_re.match(line)
+        if m:
+            body = m.group(1)
+            nv = name_version_re.match(body)
+            if nv:
+                name = nv.group(1).strip()
+                version = nv.group(2).strip()
+            else:
+                # Pod with no version paren — defensive; shouldn't
+                # happen in a well-formed lockfile but we don't
+                # crash on it.
+                name = body.strip()
+                version = None
+            pods[name] = {"version": version, "children": []}
+            current_pod = name
+
+    # DEPENDENCIES section parse: just the bare names of pods the
+    # user declared directly in their Podfile.
+    direct_names = set()
+    dep_line_re = re.compile(r'^  - (.+?)$')
+    for line in deps_lines:
+        if not line.strip():
+            continue
+        m = dep_line_re.match(line)
+        if m:
+            direct_names.add(_strip_pod_version_paren(m.group(1)))
+
+    # Reverse-walk the children map to build the parents lookup:
+    # for each child reference, the owning top-level pod is a
+    # parent. A child reference can include a subspec slash (e.g.
+    # `Braintree/Card`) — we record the parent against the exact
+    # referenced name, so subspecs end up with parents pointing at
+    # the pods that pulled them in (typically the parent pod and
+    # any cross-pod users).
+    parents_by_name = {}
+    for owner_name, info in pods.items():
+        owner_id = _make_dep_id("library", "", owner_name)
+        for child_ref in info["children"]:
+            parents_by_name.setdefault(child_ref, []).append(owner_id)
+
+    # Emit one entry per top-level pod. A pod is "direct" iff its
+    # EXACT name appears in DEPENDENCIES. CocoaPods writes subspecs
+    # into DEPENDENCIES verbatim when the user named them
+    # explicitly (`pod 'Foo', :subspecs => ['Bar']` → `Foo/Bar`
+    # appears in DEPENDENCIES). When the user writes `pod 'Foo'`
+    # against an umbrella pod, only `Foo` is in DEPENDENCIES —
+    # subspecs are pulled in transitively as children of the
+    # umbrella, which is exactly how the user intended.
+    entries = []
+    for name, info in pods.items():
+        is_direct = name in direct_names
+        entries.append({
+            "id":      _make_dep_id("library", "", name),
+            "group":   "",
+            "name":    name,
+            "version": info["version"],
+            "direct":  is_direct,
+            "scope":   None,
+            "type":    "library",
+            "parents": list(parents_by_name.get(name, [])),
+        })
+
+    return entries
+
+
+def _parse_package_resolved(path):
+    """Parse Swift Package Manager's `Package.resolved` (JSON).
+
+    Two formats exist in the wild:
+      - Xcode-managed: `{"object": {"pins": [...]}, "version": 1|2}`
+      - SPM CLI v2:    `{"pins": [...], "version": 2}` (Xcode 14+
+        and `swift package` write this at the project root)
+
+    Both carry the same per-pin information: a package identity
+    (kind/location/name) plus a resolved version pin. The resolved
+    file does NOT carry the dependency graph — only the locked
+    list — so every entry comes out as `direct=true` with no
+    parents. Tree-view rendering on the viewer reduces to a flat
+    list for SPM-only builds, which is correct: we don't have the
+    information to do better.
+    """
+    if not path or not os.path.isfile(path):
+        return []
+
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+
+    pins = None
+    if isinstance(data, dict):
+        if isinstance(data.get('pins'), list):
+            pins = data['pins']
+        elif isinstance(data.get('object'), dict) \
+                and isinstance(data['object'].get('pins'), list):
+            pins = data['object']['pins']
+    if not pins:
+        return []
+
+    entries = []
+    for pin in pins:
+        if not isinstance(pin, dict):
+            continue
+        # Identity field name differs by format:
+        #   - new format uses `identity` (lowercase package name)
+        #   - legacy format uses `package` (capitalised display name)
+        # Prefer `identity` when present so the id is stable across
+        # Xcode versions writing the same package set.
+        name = pin.get('identity') or pin.get('package')
+        if not name:
+            continue
+        version = None
+        state = pin.get('state') or {}
+        if isinstance(state, dict):
+            # `version` for tagged pins; `branch` for branch
+            # tracking; `revision` for revision-locked pins. Prefer
+            # the most specific human-readable value.
+            version = state.get('version') or state.get('branch') or state.get('revision')
+        entries.append({
+            "id":      _make_dep_id("library", "", name),
+            "group":   "",
+            "name":    name,
+            "version": version,
+            "direct":  True,
+            "scope":   None,
+            "type":    "library",
+            "parents": [],
+        })
+    return entries
+
+
+def _parse_cartfile_resolved(path):
+    """Parse a Carthage `Cartfile.resolved`. Each line has the
+    shape: `<source> "<repo>" "<version>"`. Examples:
+
+      github "ReactiveCocoa/ReactiveCocoa" "v2.3.1"
+      git "https://example.com/private.git" "1.0.0"
+      binary "https://example.com/MyBin.json" "1.0.0"
+
+    Emit one library entry per line. No graph info, so direct=true
+    and parents=[]. The repo path (e.g. `ReactiveCocoa/ReactiveCocoa`)
+    becomes the name verbatim — surfacing the slash keeps the
+    namespacing visible in the dashboard.
+    """
+    if not path or not os.path.isfile(path):
+        return []
+
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return []
+
+    entries = []
+    # `<source> "repo" "version"` — tolerate single-quoted values
+    # too (Carthage's parser does).
+    line_re = re.compile(r'^\s*(\S+)\s+["\']([^"\']+)["\']\s+["\']([^"\']+)["\']\s*$')
+    for line in lines:
+        if not line.strip() or line.strip().startswith('#'):
+            continue
+        m = line_re.match(line)
+        if not m:
+            continue
+        name = m.group(2)
+        version = m.group(3)
+        entries.append({
+            "id":      _make_dep_id("library", "", name),
+            "group":   "",
+            "name":    name,
+            "version": version,
+            "direct":  True,
+            "scope":   None,
+            "type":    "library",
+            "parents": [],
+        })
+    return entries
+
+
+# Mach-O load paths emitted by `otool -L` that point at OS-owned
+# frameworks. Stripped from the vendored-framework scan since they
+# aren't user dependencies and would just bloat the list.
+_SYSTEM_DYLIB_PREFIXES = (
+    '/usr/lib/',
+    '/System/Library/',
+    '/Library/Frameworks/',
+)
+
+
+def _parse_vendored_frameworks(binary_path):
+    """Run `otool -L` on the linked product binary and return a
+    list of dep entries for embedded / vendored frameworks. Lines
+    whose load path starts with `@rpath/`, `@executable_path/`, or
+    `@loader_path/` are the embedded frameworks shipped inside
+    the .app bundle; everything else is either the OS or a Swift
+    toolchain dylib — neither is a user dependency.
+
+    Each entry is `type="file"`, direct=true, no parents. The
+    `name` is the framework's basename (e.g. `Bugsee.framework`)
+    rather than the full @rpath path — the user-recognisable form.
+    """
+    if not binary_path or not os.path.isfile(binary_path):
+        return []
+
+    try:
+        out = subprocess.run(
+            ['/usr/bin/otool', '-L', binary_path],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+
+    seen = set()
+    entries = []
+    # Sample line: `\t@rpath/Bugsee.framework/Bugsee (compatibility version 1.0.0, current version 1.0.0)`
+    line_re = re.compile(r'^\s*([^\s]+)\s+\(compatibility version')
+    for raw in out.splitlines():
+        m = line_re.match(raw)
+        if not m:
+            continue
+        load_path = m.group(1)
+        if load_path.startswith(_SYSTEM_DYLIB_PREFIXES):
+            continue
+        if not (load_path.startswith('@rpath/')
+                or load_path.startswith('@executable_path/')
+                or load_path.startswith('@loader_path/')):
+            continue
+        # Extract the framework name: the `.framework/X` suffix
+        # carries Mach-O's binary slice name; the directory above
+        # it is the user-facing framework. Falls back to the
+        # basename if the path doesn't carry a `.framework/` token.
+        framework_match = re.search(r'/([^/]+\.framework)/', load_path)
+        if framework_match:
+            name = framework_match.group(1)
+        else:
+            name = os.path.basename(load_path)
+        if name in seen:
+            continue
+        seen.add(name)
+        entries.append({
+            "id":      _make_dep_id("file", "", name),
+            "group":   "",
+            "name":    name,
+            "version": None,
+            "direct":  True,
+            "scope":   None,
+            "type":    "file",
+            "parents": [],
+        })
+    return entries
+
+
+def _merge_dep_entries(*sources):
+    """Combine multiple dep-entry lists into one. Deduplication
+    is by entry `id` — first-occurrence wins. Order across sources
+    is preserved (CocoaPods first since it's most likely to have
+    parent edges; then SPM; then Carthage; then vendored frames),
+    so the truncation cap (if it kicks in) drops the least-
+    informative entries first.
+
+    Returns a `(entries, truncated)` pair, capped at
+    [DEPENDENCIES_MAX_COUNT]. The truncated flag drives the
+    summary's same-name field and ultimately the worker's
+    compatibility check (truncated lists aren't diff-comparable).
+    """
+    seen_ids = set()
+    out = []
+    truncated = False
+    for source in sources:
+        for entry in source:
+            if entry["id"] in seen_ids:
+                continue
+            if len(out) >= DEPENDENCIES_MAX_COUNT:
+                truncated = True
+                break
+            seen_ids.add(entry["id"])
+            out.append(entry)
+        if truncated:
+            break
+
+    # Self-consistency pass: filter parents pointing at IDs that
+    # didn't make it into the emitted set (truncation eviction
+    # OR a malformed source listing a phantom parent). Same posture
+    # as the Android plugin's post-truncation cleanup.
+    kept = {e["id"] for e in out}
+    for e in out:
+        if e["parents"]:
+            e["parents"] = [p for p in e["parents"] if p in kept]
+    return out, truncated
+
+
+def _build_dependencies_payload(entries, truncated, scope_label,
+                                include_selected_reason=False,
+                                max_count=DEPENDENCIES_MAX_COUNT,
+                                clock=None):
+    """Build the JSON-serialisable summary + blob pair. Shape
+    mirrors what the Android plugin produces (see
+    `DependencyPayloadSerializer.summaryJson` / `entriesJson`).
+
+    Returns a tuple `(summary_dict, blob_dict)`:
+      - `summary_dict` is the scalar summary sent inline on the
+        build registration POST body (under
+        `dependencies_summary`).
+      - `blob_dict` is the per-entry list serialised as JSON and
+        gzipped before PUT.
+    """
+    clock = clock or (lambda: int(time.time() * 1000))
+    total = len(entries)
+    direct = sum(1 for e in entries if e["direct"])
+    transitive = total - direct
+    by_type = {"library": 0, "project": 0, "file": 0}
+    for e in entries:
+        t = e["type"]
+        if t in by_type:
+            by_type[t] += 1
+
+    # ISO-8601 UTC with the trailing `Z` form — matches the
+    # Android plugin's `isoUtc` helper so the appserver's
+    # `new Date(collected_at)` parses identically.
+    epoch_ms = clock()
+    iso_utc = time.strftime('%Y-%m-%dT%H:%M:%SZ',
+                            time.gmtime(epoch_ms / 1000))
+
+    summary = {
+        "total":      total,
+        "direct":     direct,
+        "transitive": transitive,
+        "by_type":    by_type,
+        "truncated":  truncated,
+        "collected_at": iso_utc,
+        "collection_config": {
+            "scope":                   scope_label,
+            "include_selected_reason": include_selected_reason,
+            "max_count":               max_count,
+        },
+    }
+
+    # Per-entry blob. Omit `version` / `scope` when None, omit
+    # empty `parents` lists — same wire posture the Android
+    # serializer takes. Keeps the gzipped payload small for the
+    # common case (most pods don't have transitive children).
+    serialised = []
+    for e in entries:
+        item = {
+            "id":     e["id"],
+            "group":  e["group"],
+            "name":   e["name"],
+            "direct": e["direct"],
+            "type":   e["type"],
+        }
+        if e.get("version"):
+            item["version"] = e["version"]
+        if e.get("scope"):
+            item["scope"] = e["scope"]
+        if e.get("parents"):
+            item["parents"] = list(e["parents"])
+        serialised.append(item)
+
+    blob = {
+        "schema_version": DEPENDENCIES_SCHEMA_VERSION,
+        "dependencies":   serialised,
+    }
+    return summary, blob
+
+
+def _gzip_json_bytes(obj):
+    """Serialise `obj` to compact JSON and return gzipped bytes.
+    The blob is uploaded to a presigned S3 URL with
+    `Content-Encoding: gzip` on the worker side; the producer
+    PUT carries `application/octet-stream` (matching the Android
+    plugin's signing posture)."""
+    raw = json.dumps(obj, separators=(',', ':')).encode('utf-8')
+    return gzip.compress(raw, compresslevel=9)
+
+
+# ──────────────────────────────────────────────────────────────────
+# Xcode env + Info.plist helpers
+# ──────────────────────────────────────────────────────────────────
+
+def _read_info_plist(plist_path):
+    """Read the binary or XML Info.plist at the given path. Returns
+    a dict on success or `{}` on any error — the caller treats
+    missing fields as best-effort and falls back to env vars."""
+    if not plist_path or not os.path.isfile(plist_path):
+        return {}
+    try:
+        with open(plist_path, 'rb') as f:
+            return plistlib.load(f)
+    except Exception:
+        return {}
+
+
+def _collect_build_metadata():
+    """Read Xcode environment + Info.plist into the build-registration
+    POST body shape. Mirrors the Android plugin's metadata block —
+    the appserver / viewer consume the same field names regardless
+    of platform.
+
+    Returns a tuple of `(body_dict, dwarf_uuid_or_none)`. The
+    body's `uuid` carries the Mach-O image UUID extracted from the
+    dSYM via dwarfdump; the value is also returned so the caller
+    can pass it to the symbols-upload step without re-running
+    dwarfdump.
+    """
+    build_dir = os.environ.get('TARGET_BUILD_DIR') or options.build_dir or ''
+    info_path_rel = os.environ.get('INFOPLIST_PATH', '')
+    info_path = os.path.join(build_dir, info_path_rel) if info_path_rel else ''
+    info = _read_info_plist(info_path)
+
+    version = info.get('CFBundleShortVersionString') \
+        or os.environ.get('MARKETING_VERSION') \
+        or (options.version if options.version else None)
+    build_number = info.get('CFBundleVersion') \
+        or os.environ.get('CURRENT_PROJECT_VERSION') \
+        or (options.build if options.build else None)
+    bundle_id = info.get('CFBundleIdentifier') \
+        or os.environ.get('PRODUCT_BUNDLE_IDENTIFIER')
+
+    body = {
+        # Mach-O UUID is filled in by the caller (after dwarfdump).
+        "uuid": None,
+        "package_id":          bundle_id,
+        "version":             str(version) if version is not None else None,
+        "build":               str(build_number) if build_number is not None else None,
+        "build_configuration": os.environ.get('CONFIGURATION'),
+        # iOS deploy format. The appserver's ALLOWED_BUILD_FORMATS
+        # set includes 'ipa' alongside 'apk' / 'aab'.
+        "format":              "ipa",
+        "has_mapping":         False,  # no Java-style ProGuard mapping on iOS
+        "build_metadata": {
+            "machine": {
+                "host": platform.node(),
+                "os":   platform.platform(),
+                "arch": platform.machine(),
+            },
+            "build_system": {
+                "type":    "xcode",
+                "version": os.environ.get('XCODE_VERSION_ACTUAL'),
+            },
+            "agent": {
+                "name":    "BugseeAgent",
+                # Resolved relative to the script — keeps the value
+                # honest even when the SDK ships multiple agent
+                # versions in different distributions.
+                "script":  os.path.basename(__file__),
+            },
+        },
+    }
+    return body
+
+
+def _extract_first_dwarf_uuid():
+    """Scan the dSYM folder for the FIRST Mach-O UUID we can find
+    via dwarfdump. The Android plugin sends a single per-build
+    UUID; we mirror that posture by surfacing the main binary's
+    first arch slice UUID (typically arm64). Returns None on any
+    error or if no dSYMs are present."""
+    folder = options.dsym_folder
+    if not folder or not os.path.isdir(folder):
+        return None
+    for root, dirs, files in os.walk(folder):
+        if not root.endswith('dSYM/Contents/Resources/DWARF'):
+            continue
+        for f in files:
+            full = os.path.join(root, f)
+            if os.path.islink(full) or os.stat(full).st_size == 0:
+                continue
+            uuids = parseDSYM(full)
+            if uuids:
+                return uuids[0]
+    return None
+
+
+def _resolve_product_binary_path():
+    """Resolve the path to the linked product binary for the
+    vendored-framework scan. Uses Xcode env vars
+    `EXECUTABLE_PATH` and `TARGET_BUILD_DIR` which together name
+    the exact Mach-O the linker emitted for this build. Returns
+    None when run outside Xcode."""
+    build_dir = os.environ.get('TARGET_BUILD_DIR') or options.build_dir
+    exe_path = os.environ.get('EXECUTABLE_PATH')
+    if not build_dir or not exe_path:
+        return None
+    candidate = os.path.join(build_dir, exe_path)
+    return candidate if os.path.isfile(candidate) else None
+
+
+# ──────────────────────────────────────────────────────────────────
+# Dependency-source discovery
+# ──────────────────────────────────────────────────────────────────
+
+def _find_first_above(start_dir, filename, max_levels=6):
+    """Walk up from `start_dir` looking for `filename`. CocoaPods
+    / SPM / Carthage lockfiles all sit at the project root, which
+    is somewhere ABOVE the Xcode build directory at runtime — the
+    walk-up locates them without the caller having to know the
+    exact relative depth.
+
+    `max_levels` caps the climb so a misconfigured environment
+    can't send us all the way to `/`. Returns the absolute path on
+    hit or None on miss.
+    """
+    if not start_dir:
+        return None
+    current = os.path.abspath(start_dir)
+    for _ in range(max_levels):
+        candidate = os.path.join(current, filename)
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+    return None
+
+
+def _collect_all_dependencies(project_root):
+    """Run every parser against the project root and return the
+    merged entry list plus the `(scope_label, truncated)` tuple
+    the payload builder needs.
+
+    `project_root` is the directory we walk up from to find each
+    source lockfile. In an Xcode build that's `SRCROOT` (or
+    `$PROJECT_DIR`); outside Xcode (CLI testing) the caller passes
+    the project root explicitly.
+    """
+    podfile = _find_first_above(project_root, 'Podfile.lock')
+    package_resolved = (
+        _find_first_above(project_root, 'Package.resolved')
+        # SPM CLI writes Package.resolved at the package root, but
+        # Xcode-managed projects keep one under
+        # `*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/`.
+        # Search for that variant too if the top-level miss.
+        or _find_first_above(project_root,
+                             os.path.join('xcshareddata', 'swiftpm',
+                                          'Package.resolved'))
+    )
+    cartfile = _find_first_above(project_root, 'Cartfile.resolved')
+    binary = _resolve_product_binary_path()
+
+    pods_entries = _parse_podfile_lock(podfile) if podfile else []
+    spm_entries  = _parse_package_resolved(package_resolved) if package_resolved else []
+    cart_entries = _parse_cartfile_resolved(cartfile) if cartfile else []
+    vendored_entries = _parse_vendored_frameworks(binary) if binary else []
+
+    merged, truncated = _merge_dep_entries(
+        pods_entries, spm_entries, cart_entries, vendored_entries,
+    )
+    # `scope` here describes the COLLECTION scope (Android plugin
+    # uses 'runtime' / 'runtime_direct_only'). iOS doesn't have
+    # that distinction; surface 'all' so the worker's
+    # compatibility check still has a stable token to compare
+    # against across builds.
+    return merged, "all", truncated
+
+
+# ──────────────────────────────────────────────────────────────────
+# Bugsee API client (build registration + presigned upload)
+# ──────────────────────────────────────────────────────────────────
+
+def _request_build_registration(app_token, endpoint, body_json):
+    """POST the build registration body to /v2/apps/{token}/builds
+    and return the unwrapped result payload (the inner `result`
+    object the appserver wraps every v2 response in). Returns None
+    on any error — callers fall back to skipping the deps upload
+    step.
+
+    Response shape from the appserver:
+      success: {"ok": true, "result": { <payload> }}
+      failure: {"ok": false, "error": { "type": ..., "message": ... }}
+
+    The Android plugin's `ApiEndpoint.unwrapResult` performs the
+    same unwrap; we mirror its posture so the caller sees a flat
+    payload regardless of platform.
+    """
+    url = endpoint.rstrip('/') + '/v2/apps/' + urllib.parse.quote(app_token) + '/builds'
+    try:
+        req = urllib.request.Request(
+            url, data=body_json.encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = json.loads(resp.read().decode('utf-8'))
+    except (urllib.error.URLError, urllib.error.HTTPError,
+            ValueError, OSError) as e:
+        print("Bugsee: build registration failed: %s" % e)
+        return None
+
+    # Unwrap `{ok, result}` envelope. `ok: false` is surfaced as a
+    # logged error and None return so the caller can short-circuit.
+    if not isinstance(raw, dict):
+        print("Bugsee: build registration: unexpected response type %s"
+              % type(raw).__name__)
+        return None
+    if raw.get('ok') is False:
+        err = raw.get('error') or {}
+        if isinstance(err, dict):
+            print("Bugsee: build registration rejected: %s (%s)"
+                  % (err.get('message', '(no message)'), err.get('type', '?')))
+        else:
+            print("Bugsee: build registration rejected (no error detail).")
+        return None
+    result = raw.get('result')
+    if isinstance(result, dict):
+        return result
+    # Some appserver routes return a flat payload without the
+    # `{ok, result}` envelope (legacy endpoints). Return the raw
+    # dict in that case so we don't lose information.
+    return raw
+
+
+def _put_dependencies_blob(endpoint_url, gz_bytes):
+    """PUT the gzipped deps JSON to the presigned URL the appserver
+    returned. Matches the Android plugin's signing posture:
+    `Content-Type: application/octet-stream`, no Content-Encoding
+    header on the producer PUT (the worker sets it when moving
+    bytes to the store bucket). Returns True on success.
+    """
+    try:
+        req = urllib.request.Request(
+            endpoint_url, data=gz_bytes,
+            headers={'Content-Type': 'application/octet-stream'},
+            method='PUT',
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            status = getattr(resp, 'status', 200)
+            return 200 <= status < 300
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        print("Bugsee: dependencies upload failed: %s" % e)
+        return False
+
+
+def _run_dependencies_pipeline(app_token, project_root):
+    """Top-level driver wired into [main] when --deps is enabled.
+
+    Returns True on a successful end-to-end run (build registered
+    AND blob uploaded) or False on any failure. Logs a one-line
+    status summary either way so CI logs surface the outcome.
+    Failures here MUST NOT block the existing symbols-upload step
+    — both pipelines are independent.
+    """
+    entries, scope_label, truncated = _collect_all_dependencies(project_root)
+    if not entries:
+        print("Bugsee: no dependency sources found (Podfile.lock / "
+              "Package.resolved / Cartfile.resolved / linked frameworks); "
+              "skipping dependencies upload.")
+        return False
+
+    summary, blob = _build_dependencies_payload(
+        entries, truncated, scope_label,
+        include_selected_reason=False,
+        max_count=DEPENDENCIES_MAX_COUNT,
+    )
+
+    body = _collect_build_metadata()
+    body["uuid"] = _extract_first_dwarf_uuid()
+    body["request_artifact_upload"]      = False
+    body["request_dependencies_upload"]  = True
+    body["dependencies_summary"]         = summary
+
+    response = _request_build_registration(
+        app_token, options.endpoint, json.dumps(body))
+    if not response:
+        return False
+
+    deps_endpoint = response.get('dependencies_upload_endpoint')
+    if not deps_endpoint:
+        print("Bugsee: server did not return a dependencies upload endpoint — "
+              "skipping deps PUT.")
+        return False
+
+    gz_bytes = _gzip_json_bytes(blob)
+    print("Bugsee: uploading dependencies blob (%d entries, %d bytes gzipped)"
+          % (len(entries), len(gz_bytes)))
+    return _put_dependencies_blob(deps_endpoint, gz_bytes)
 
 
 def isInUploadedList(images, imageList):
@@ -356,8 +1181,14 @@ def uploadZipFile(zipFileLocation):
     return False
 
 def main():
-    # The actual dSYM upload is performed by the bugsee-cli Rust binary,
-    # one invocation per `.dSYM` bundle. This loop's role is:
+    # Symbols-pipeline entry. The deps pipeline is now invoked
+    # separately from the post-daemonization slot at module level
+    # (see the `if __name__ == "__main__":` block) so it runs
+    # regardless of whether the build has dSYM symbols to upload.
+    #
+    # As of the bugsee-cli migration, the actual dSYM upload is
+    # performed by the bugsee-cli Rust binary, one invocation per
+    # `.dSYM` bundle. This loop's role is:
     #   - discover .dSYM bundles under options.dsym_folder
     #   - extract Mach-O UUIDs (via dwarfdump) to short-circuit
     #     dSYMs whose UUIDs are already in ~/.bugseeUploadList
@@ -499,6 +1330,15 @@ if __name__ == "__main__":
                   help="Set the version of the application dSYM corresponds to")
     parser.add_option("-d", "--build_dir", dest="build_dir",
                   help="Use for custom TARGET_BUILD_DIR", default=os.environ.get('TARGET_BUILD_DIR'))
+    # Dependencies-collection toggle. On by default — registers
+    # the build with Bugsee and uploads a per-build deps blob
+    # parsed from Podfile.lock / Package.resolved / Cartfile.resolved
+    # / linked vendored frameworks. Disable with --no-deps if the
+    # consumer wants the legacy symbols-only flow.
+    parser.add_option("--no-deps", dest="collect_deps", action="store_false",
+                  default=True,
+                  help="Skip the build registration + dependencies upload "
+                       "step. Symbols upload still runs as before.")
     # bugsee-cli override knobs. See the resolver block near the top of
     # this file for the full precedence rules.
     parser.add_option("--cli-path", dest="cli_path",
@@ -512,34 +1352,51 @@ if __name__ == "__main__":
                   help="bugsee-cli version to auto-download when --cli-path is "
                        "unset. Defaults to BUGSEE_CLI_DEFAULT_VERSION (pinned to "
                        "the version this agent was shipped against).")
+    parser.add_option("--project-root", dest="project_root",
+                  default=os.environ.get('SRCROOT') or os.environ.get('PROJECT_DIR'),
+                  help="Root of the iOS project — where lockfiles "
+                       "(Podfile.lock / Package.resolved / Cartfile.resolved) "
+                       "are searched for. Defaults to $SRCROOT then "
+                       "$PROJECT_DIR when run from Xcode.")
     (options, args) = parser.parse_args()
+
+    # ──────────────────────────────────────────────
+    # App-token check (BEFORE daemonization)
+    # ──────────────────────────────────────────────
+    # Pulled in front of the fork so a missing-token error reaches
+    # the user's terminal / Xcode build log instead of being
+    # swallowed by the daemonized child's redirected stdout.
+    if (len(args) < 1):
+        print("Bugsee:  Not initialized with app token. Must be passed as a parameter")
+        exit(1)
+    APP_TOKEN = args[0]
 
     if options.from_xcode:
         # do the UNIX double-fork magic, see Stevens' "Advanced
         # Programming in the UNIX Environment" for details (ISBN 0201563177)
-        try: 
-            pid = os.fork() 
+        try:
+            pid = os.fork()
             if pid > 0:
                 # exit first parent
-                sys.exit(0) 
-        except OSError as e: 
-            print("fork #1 failed: %d (%s)" % (e.errno, e.strerror), file=sys.stderr) 
+                sys.exit(0)
+        except OSError as e:
+            print("fork #1 failed: %d (%s)" % (e.errno, e.strerror), file=sys.stderr)
             sys.exit(1)
 
         # decouple from parent environment
-        os.chdir("/") 
-        os.setsid() 
-        os.umask(0) 
+        os.chdir("/")
+        os.setsid()
+        os.umask(0)
 
         # do second fork
-        try: 
-            pid = os.fork() 
+        try:
+            pid = os.fork()
             if pid > 0:
                 # exit from second parent, print eventual PID before
-                print("Daemon PID %d" % pid) 
-                sys.exit(0) 
-        except OSError as e: 
-            print("fork #2 failed: %d (%s)" % (e.errno, e.strerror), file=sys.stderr) 
+                print("Daemon PID %d" % pid)
+                sys.exit(0)
+        except OSError as e:
+            print("fork #2 failed: %d (%s)" % (e.errno, e.strerror), file=sys.stderr)
             sys.exit(1)
 
         # redirect standard file descriptors
@@ -555,6 +1412,36 @@ if __name__ == "__main__":
         os.dup2(so.fileno(), sys.stdout.fileno())
         os.dup2(se.fileno(), sys.stderr.fileno())
 
+    # ──────────────────────────────────────────────
+    # Dependencies pipeline (runs in the daemonized child)
+    # ──────────────────────────────────────────────
+    #
+    # Hoisted ABOVE the dSYM / simulator gates that follow because
+    # the deps pipeline is independent of symbolication:
+    #
+    #   - Debug builds with `DEBUG_INFORMATION_FORMAT != dwarf-with-dsym`
+    #     still ship their lockfile-derived dep list.
+    #   - Simulator builds skip symbols but still get deps.
+    #
+    # Errors are caught and logged so a deps failure (parser bug,
+    # network blip, ngrok tunnel down) cannot prevent the symbols
+    # pipeline from running afterward — the two are independent.
+    if options.collect_deps:
+        try:
+            _run_dependencies_pipeline(APP_TOKEN, options.project_root)
+        except Exception as e:
+            print("Bugsee: dependencies pipeline failed: %s — "
+                  "continuing with symbols upload." % e)
+
+    # ──────────────────────────────────────────────
+    # Symbols-pipeline gates
+    # ──────────────────────────────────────────────
+    # Each gate exits the (already-daemonized) process cleanly so
+    # the user's build log doesn't spam errors about dSYMs that
+    # aren't supposed to exist on Debug / simulator builds. Deps
+    # already ran above — these gates only short-circuit the
+    # symbols half.
+    if options.from_xcode:
         if os.environ.get('DEBUG_INFORMATION_FORMAT') != 'dwarf-with-dsym':
             print("Bugsee:  DEBUG_INFORMATION_FORMAT is not set. Have you enabled debug symbols in your build? See: https://docs.bugsee.com/sdk/ios/symbolication/")
             exit(0)
@@ -562,13 +1449,6 @@ if __name__ == "__main__":
         if os.environ.get('EFFECTIVE_PLATFORM_NAME') == '-iphonesimulator':
             print("Bugsee:  Bugsee is not supoorted in iOS simulator. Will not upload debug symbols for i386!")
             exit(0)
-
-
-    if (len(args) < 1):
-        print("Bugsee:  Not initialized with app token. Must be passed as a parameter")
-        exit(1)
-
-    APP_TOKEN = args[0]
 
     if not options.build_dir:
         print('Target build directory was not specified. Either provide it with the "-d" option or set "TARGET_BUILD_DIR" environment variable')
@@ -584,5 +1464,5 @@ if __name__ == "__main__":
             print("Bugsee:  Can not find dSYM folder (expecting either a -f option or DWARF_DSYM_FOLDER_PATH)")
             exit(1)
 
-    # start the daemon main loop
-    main() 
+    # start the daemon main loop (symbols pipeline only)
+    main()
