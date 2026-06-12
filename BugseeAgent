@@ -857,6 +857,36 @@ def _resolve_git_fallback(working_dir):
     return out
 
 
+def _resolve_vcs_metadata_via_cli(cli_binary, working_dir):
+    """Shell to `bugsee-cli vcs-metadata` and parse its JSON output.
+
+    Part of the Option-C migration that moved VCS resolution to the
+    Rust CLI as the single canonical implementation. The Python
+    fallback below is preserved for the case where the CLI isn't
+    available (older CLI versions that don't have the subcommand,
+    a stripped-down env without auto-download, etc.).
+
+    Returns the parsed dict on success, or None on any failure
+    (subprocess error, non-zero exit, malformed JSON). The caller
+    falls back to the Python implementation on None.
+    """
+    if not cli_binary:
+        return None
+    try:
+        result = subprocess.run(
+            [cli_binary, "vcs-metadata", "--working-dir", working_dir or "."],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        if not out:
+            return None
+        return json.loads(out)
+    except (OSError, ValueError):
+        return None
+
+
 def resolve_vcs_metadata(working_dir):
     """Returns a dict shaped for the upload JSON's nested `vcs`
     sub-object. Matches what the Android Gradle plugin emits so the
@@ -874,7 +904,34 @@ def resolve_vcs_metadata(working_dir):
          none of the CI providers matched. Lets local dev archives
          still carry `commit_sha` / `branch` without needing CI
          context.
+
+    Implementation: prefers the Rust `bugsee-cli vcs-metadata`
+    subcommand (the single cross-language source of truth, ported
+    from this Python function — see
+    `bugsee-cli/src/cli/vcs_metadata.rs`). Falls back to the
+    in-process Python implementation below when the CLI isn't
+    available so cold-start environments without the CLI cache
+    still produce a usable result.
     """
+    # Try the Rust CLI first — same algorithm, in the canonical
+    # cross-language implementation. `options` is set by main() in
+    # production but unset at import time (tests load the agent as
+    # a module without ever invoking main()); the NameError catch
+    # lets the resolver still invoke resolveCli with defaults so
+    # the mock-based unit tests can exercise the CLI path.
+    cli_path_opt = None
+    cli_version_opt = None
+    try:
+        cli_path_opt = getattr(options, 'cli_path', None)
+        cli_version_opt = getattr(options, 'cli_version', None)
+    except NameError:
+        pass
+    cli = resolveCli(cli_path_opt, cli_version_opt)
+    if cli:
+        via_cli = _resolve_vcs_metadata_via_cli(cli, working_dir)
+        if via_cli is not None:
+            return via_cli
+
     env = os.environ
 
     # GitHub Actions ----------------------------------------------

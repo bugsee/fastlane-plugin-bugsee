@@ -1495,6 +1495,133 @@ class TestResolveVcsMetadata(unittest.TestCase):
                 agent.resolve_vcs_metadata(plain_dir), {})
 
 
+class TestResolveVcsMetadataViaCli(unittest.TestCase):
+    """Pins the Option-C migration of VCS resolution to bugsee-cli
+    (the Rust subcommand `bugsee-cli vcs-metadata`). The Python
+    fallback in `resolve_vcs_metadata` MUST remain a usable
+    fallback for environments where the CLI isn't available — but
+    when the CLI IS available, its JSON output MUST be honored
+    verbatim (one cross-language source of truth)."""
+
+    def _stub_run(self, returncode=0, stdout='{}'):
+        # subprocess.run mock that mimics the CompletedProcess
+        # shape the production code accesses (.returncode +
+        # .stdout). Defaults to a successful empty-object run.
+        return SimpleNamespace(returncode=returncode, stdout=stdout)
+
+    def test_uses_cli_output_when_cli_is_available(self):
+        # Production code: resolveCli returns a path → CLI is
+        # invoked → JSON parsed → returned directly. The Python
+        # fallback below MUST NOT fire.
+        canned = '{"provider":"github","commit_sha":"from-cli",' \
+                 '"branch":"main","repo":"org/repo"}'
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/path/to/bugsee-cli') as cli_mock, \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout=canned)) as run_mock:
+            vcs = agent.resolve_vcs_metadata('/some/dir')
+        # The CLI subcommand's JSON wins — provider and
+        # commit_sha must match what the CLI returned, NOT what
+        # the Python fallback would have synthesized.
+        self.assertEqual(vcs['provider'],   'github')
+        self.assertEqual(vcs['commit_sha'], 'from-cli')
+        # resolveCli was consulted; subprocess.run was invoked
+        # with the vcs-metadata subcommand and the working-dir.
+        cli_mock.assert_called_once()
+        run_mock.assert_called_once()
+        argv = run_mock.call_args[0][0]
+        self.assertEqual(argv[0], '/path/to/bugsee-cli')
+        self.assertIn('vcs-metadata', argv)
+        wd_idx = argv.index('--working-dir')
+        self.assertEqual(argv[wd_idx + 1], '/some/dir')
+
+    def test_falls_back_to_python_when_cli_unavailable(self):
+        # resolveCli returns None (download failed, unsupported
+        # host triple, etc.) → Python fallback fires. Asserted
+        # by setting GITHUB_ACTIONS env so the Python fallback
+        # has something to return.
+        with mock.patch.dict(os.environ, {
+            'GITHUB_ACTIONS': 'true',
+            'GITHUB_SHA':     'python-sha',
+            'GITHUB_REF':     'refs/heads/master',
+        }, clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value=None), \
+                mock.patch.object(agent.subprocess, 'run') as run_mock:
+            vcs = agent.resolve_vcs_metadata('/no/dir')
+        self.assertEqual(vcs['provider'],   'github')
+        self.assertEqual(vcs['commit_sha'], 'python-sha')
+        # No subprocess.run call attempted — Python only.
+        self.assertEqual(run_mock.call_count, 0)
+
+    def test_falls_back_to_python_on_cli_nonzero_exit(self):
+        # CLI exits non-zero (e.g. older bugsee-cli without the
+        # vcs-metadata subcommand → clap prints "error: unknown
+        # command" and exits 2). MUST fall back rather than
+        # bubble the failure.
+        with mock.patch.dict(os.environ, {
+            'GITHUB_ACTIONS': 'true',
+            'GITHUB_SHA':     'fallback-sha',
+            'GITHUB_REF':     'refs/heads/main',
+        }, clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=2, stdout='')):
+            vcs = agent.resolve_vcs_metadata('/no/dir')
+        self.assertEqual(vcs['commit_sha'], 'fallback-sha')
+
+    def test_falls_back_to_python_on_malformed_cli_json(self):
+        # If the CLI prints garbage (or a partial stream), the
+        # Python json.loads raises ValueError — we treat this as
+        # CLI unavailable and fall back.
+        with mock.patch.dict(os.environ, {
+            'GITHUB_ACTIONS': 'true',
+            'GITHUB_SHA':     'fallback-sha',
+            'GITHUB_REF':     'refs/heads/main',
+        }, clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout='not json')):
+            vcs = agent.resolve_vcs_metadata('/no/dir')
+        self.assertEqual(vcs['commit_sha'], 'fallback-sha')
+
+    def test_falls_back_to_python_on_oserror(self):
+        # ENOEXEC / FileNotFoundError on a stale CLI path → OSError
+        # → fall back. Same posture as the dSYM upload path.
+        with mock.patch.dict(os.environ, {
+            'GITHUB_ACTIONS': 'true',
+            'GITHUB_SHA':     'fallback-sha',
+            'GITHUB_REF':     'refs/heads/main',
+        }, clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  side_effect=OSError("ENOEXEC")):
+            vcs = agent.resolve_vcs_metadata('/no/dir')
+        self.assertEqual(vcs['commit_sha'], 'fallback-sha')
+
+    def test_uses_working_dir_default_when_empty(self):
+        # `working_dir` empty string → CLI invoked with "." so it
+        # falls back to the CWD rather than the literal empty
+        # string (which `git -C ''` would reject).
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(agent, 'resolveCli',
+                                  return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout='{}')) as run_mock:
+            agent.resolve_vcs_metadata('')
+        argv = run_mock.call_args[0][0]
+        wd_idx = argv.index('--working-dir')
+        self.assertEqual(argv[wd_idx + 1], '.')
+
+
 class TestResolveXcodeVersion(unittest.TestCase):
     def test_decodes_numeric_env_var_to_dotted_form(self):
         # Xcode exports `XCODE_VERSION_ACTUAL=1620` for Xcode 16.2.0;
