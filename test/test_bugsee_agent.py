@@ -1836,6 +1836,30 @@ class TestResolveVcsMetadata(unittest.TestCase):
         self.assertNotIn('pr_number', vcs)
         self.assertNotIn('base_branch', vcs)
 
+    def test_github_actions_tag_push_omits_branch(self):
+        # Tag push: GITHUB_REF=refs/tags/<tag>, EVENT=push. Pre-fix
+        # the `.replace('refs/heads/', '', 1)` left the ref unchanged
+        # (`refs/tags/v1.0.0`) and the dashboard rendered the literal
+        # string in the branch column. Post-fix: only emit `branch`
+        # when the ref starts with `refs/heads/`. Matches the Android
+        # Gradle plugin's canonical Kotlin resolver and the Rust CLI.
+        with mock.patch.dict(os.environ, {
+            'GITHUB_ACTIONS':     'true',
+            'GITHUB_SHA':         'tag-sha-abc',
+            'GITHUB_REPOSITORY':  'org/repo',
+            'GITHUB_REF':         'refs/tags/v1.0.0',
+            'GITHUB_EVENT_NAME':  'push',
+        }, clear=True):
+            vcs = agent.resolve_vcs_metadata('/no/working/dir')
+        self.assertEqual(vcs['provider'],   'github')
+        self.assertEqual(vcs['commit_sha'], 'tag-sha-abc')
+        # branch must NOT appear — neither as literal ref string nor
+        # as an empty value. The canonical contract is omission.
+        self.assertNotIn(
+            'branch', vcs,
+            "tag-pushed branch must be omitted, not the literal ref"
+        )
+
     def test_github_actions_pull_request(self):
         # PR event: GITHUB_HEAD_REF / GITHUB_BASE_REF carry the
         # source / target branches; PR number is dug out of the

@@ -1086,8 +1086,18 @@ def resolve_vcs_metadata(working_dir):
             if m:
                 out['pr_number'] = int(m.group(1))
         else:
-            branch = (env.get('GITHUB_REF') or '').replace('refs/heads/', '', 1)
-            _set_if_present(out, 'branch', branch)
+            # Push event: GITHUB_REF carries `refs/heads/<branch>` for
+            # a branch push, `refs/tags/<tag>` for a tag push. Only
+            # emit `branch` when the ref is actually a head ref. The
+            # historical `.replace('refs/heads/', '', 1)` returned the
+            # raw `refs/tags/v1.0.0` ref on tag pushes, which then
+            # landed in the dashboard's branch column verbatim. Match
+            # the Android Gradle plugin's canonical Kotlin resolver
+            # (`removePrefix.takeIf { it != ref }`) and the Rust CLI
+            # (bugsee-cli@cf1325f).
+            ref = (env.get('GITHUB_REF') or '')
+            if ref.startswith('refs/heads/'):
+                _set_if_present(out, 'branch', ref[len('refs/heads/'):])
         return out
 
     # GitLab CI ---------------------------------------------------
