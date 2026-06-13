@@ -34,6 +34,7 @@ import time
 import math
 import platform
 import struct
+import uuid
 from optparse import OptionParser
 import fnmatch
 
@@ -74,7 +75,18 @@ _BUGSEE_CLI_VERSION_RE = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$
 #     bite the dsym helper hit during TestParseDSYM hardening)
 #   - subprocess.CalledProcessError: a side_effect in test mocks that
 #     raise rather than return a fake CompletedProcess
-_CLI_CATCHALL_EXCEPTIONS = (OSError, ValueError, TypeError, subprocess.CalledProcessError)
+_CLI_CATCHALL_EXCEPTIONS = (
+    OSError,
+    ValueError,
+    TypeError,
+    subprocess.CalledProcessError,
+    # TimeoutExpired: the CLI hung past its `subprocess.run(timeout=...)`
+    # cap. Treat as a soft failure so the fallback (in-process Python)
+    # path runs — a deadlocked CLI, SIGSTOP'd process, NFS-mounted
+    # binary stalling on first run, or an OS sandbox prompt waiting
+    # for user interaction would otherwise crash the build.
+    subprocess.TimeoutExpired,
+)
 
 
 def detectHostTriple():
@@ -128,7 +140,15 @@ def resolveCli(cliPath=None, cliVersion=None):
     if cache_key in _resolveCli_cache:
         return _resolveCli_cache[cache_key]
     result = _resolveCli_uncached(cliPath, cliVersion)
-    _resolveCli_cache[cache_key] = result
+    # ONLY cache successful resolutions. A None result means the
+    # network was down, the SHA mismatched, or the host was unsupported
+    # on THIS call — but a subsequent call (after network comes up,
+    # after a retry, after the user installs the binary manually mid-
+    # build) may succeed. Caching the None would short-circuit every
+    # subsequent helper to the in-process fallback for the rest of
+    # the process lifetime.
+    if result is not None:
+        _resolveCli_cache[cache_key] = result
     return result
 
 
@@ -182,6 +202,24 @@ def _downloadCli(version, triple, cacheDir):
     artifact = "bugsee-cli-%s.%s" % (triple, ext)
     url = "%s/v%s/%s" % (BUGSEE_CLI_DOWNLOAD_BASE, version, artifact)
     sha_url = url + ".sha256"
+
+    # Defence-in-depth: refuse to fetch from anywhere but the literal
+    # https://download.bugsee.com host. BUGSEE_CLI_DOWNLOAD_BASE is a
+    # module global an importer can shadow, and the URL composition
+    # accepts any string before the version segment. Pin both the
+    # scheme and the host before either urlopen so neither a hostile
+    # import nor a typo on the base const can redirect downloads to
+    # an attacker-controlled origin. The sidecar verifies tarball
+    # integrity, not origin authenticity — those are independent
+    # protections that must both hold.
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname != "download.bugsee.com":
+        raise ValueError(
+            "Refusing to download bugsee-cli from non-canonical origin %s "
+            "(scheme=%s host=%s); set BUGSEE_CLI_DOWNLOAD_BASE back to "
+            "https://download.bugsee.com/cli to restore."
+            % (url, parsed.scheme, parsed.hostname)
+        )
 
     print("Bugsee: downloading bugsee-cli v%s for %s from %s" % (version, triple, url))
 
@@ -1119,7 +1157,22 @@ def resolve_vcs_metadata(working_dir):
             except (TypeError, ValueError):
                 pass
         else:
-            _set_if_present(out, 'branch', env.get('CI_COMMIT_REF_NAME'))
+            # Branch vs tag pipeline distinction. GitLab CI sets:
+            #   - CI_COMMIT_BRANCH on branch pipelines (not tag).
+            #   - CI_COMMIT_TAG on tag pipelines (not branch).
+            #   - CI_COMMIT_REF_NAME is ALWAYS set; on a tag pipeline
+            #     it equals the tag name. Without the gate, tag
+            #     pipelines leaked the tag into the branch column.
+            # Prefer CI_COMMIT_BRANCH; if absent and CI_COMMIT_TAG is
+            # set, leave branch absent. Fall back to CI_COMMIT_REF_NAME
+            # only for legacy GitLab (pre-12.6) that lacked the
+            # specific markers.
+            if (env.get('CI_COMMIT_BRANCH') or '').strip():
+                _set_if_present(out, 'branch', env.get('CI_COMMIT_BRANCH'))
+            elif (env.get('CI_COMMIT_TAG') or '').strip():
+                pass  # tag pipeline — branch stays absent
+            else:
+                _set_if_present(out, 'branch', env.get('CI_COMMIT_REF_NAME'))
         return out
 
     # Bitbucket Pipelines -----------------------------------------
@@ -1265,6 +1318,69 @@ def _read_info_plist(plist_path):
             return plistlib.load(f)
     except Exception:
         return {}
+
+
+def resolve_bundle_info_from_app(app_path):
+    """Read the Info.plist inside a `.app` bundle and return
+    `(bundle_id, version, build)`. Any field may be None when the
+    plist lacks it or can't be read.
+
+    Mirrors the SDK BugseeAgent's
+    `tools.bundle/BugseeAgent::resolve_bundle_info_from_app` so the
+    fastlane artefact-upload flow ships the SAME baseline-lookup
+    keys (`package_id`, `version`, `build`) the SDK does. Without
+    matching keys the back-end's `/builds/baseline` lookup never
+    finds a previous build for the same package, and the dashboard's
+    size-trend chart silently shows no delta.
+    """
+    if not app_path or not os.path.isdir(app_path):
+        return (None, None, None)
+    plist_path = os.path.join(app_path, 'Info.plist')
+    info = _read_info_plist(plist_path)
+    if not isinstance(info, dict):
+        return (None, None, None)
+    return (
+        info.get('CFBundleIdentifier'),
+        info.get('CFBundleShortVersionString'),
+        info.get('CFBundleVersion'),
+    )
+
+
+def _extract_uuid_from_app(app_path):
+    """Extract the main executable's Mach-O `LC_UUID` from `app_path`
+    and format it the way the iOS SDK reports it at runtime — 32
+    lowercase hex chars, no dashes. Returns None on any failure
+    (missing CFBundleExecutable, binary absent, CLI missing).
+
+    Shells to `bugsee-cli dsym uuid <main_binary>` and picks the
+    FIRST returned UUID. The CLI's `dsym slices` subcommand returns
+    arch-aware tuples; we use the simpler `dsym uuid` here because
+    most fastlane archive flows are single-arch arm64 device builds
+    (the only arch that matters for crash-to-build join). The
+    SDK side has its own `get_main_executable_uuid` with a full
+    arch-preference cascade — call that out as a follow-up if
+    fastlane-uploaded multi-arch builds ever materialise.
+
+    The format matches `BGSCrashReport.m`'s LC_UUID reporting so
+    the back-end can join `crash.uuid → build.uuid` deterministically.
+    """
+    if not app_path or not os.path.isdir(app_path):
+        return None
+    plist_path = os.path.join(app_path, 'Info.plist')
+    info = _read_info_plist(plist_path)
+    executable_name = info.get('CFBundleExecutable') if isinstance(info, dict) else None
+    if not executable_name:
+        return None
+    binary_path = os.path.join(app_path, executable_name)
+    if not os.path.isfile(binary_path):
+        return None
+    uuids = _parse_dsym_via_cli(binary_path)
+    if not uuids:
+        return None
+    # First slice's UUID, normalised to lowercase hex without
+    # dashes — matches the iOS runtime's
+    # `[NSString stringWithFormat:@"%02X..."] lowercaseString` shape.
+    return uuids[0].replace('-', '').lower()
 
 
 def _collect_build_metadata():
@@ -1429,8 +1545,18 @@ def package_app_as_ipa(app_path, output_ipa_path):
                     info.external_attr = (st_mode & 0xFFFF) << 16
                 except OSError:
                     pass
-                with open(src, 'rb') as fp:
-                    zf.writestr(info, fp.read())
+                # Stream each file into the archive instead of
+                # `zf.writestr(info, fp.read())` — the latter slurps
+                # the entire source file into a transient bytes
+                # buffer, doubling RSS for every embedded Mach-O. A
+                # 300 MB main binary + 100 MB Swift stdlib + asset
+                # catalogs would peak well over 1 GB on a CI runner
+                # with 4 GB total. `zf.open(info, 'w')` returns a
+                # stream-capable target; copy in 64 KB chunks.
+                # `compress_type` MUST be set on the ZipInfo BEFORE
+                # `zf.open` consumes it (already done above).
+                with open(src, 'rb') as fp, zf.open(info, 'w') as dst:
+                    shutil.copyfileobj(fp, dst, length=65536)
     return output_ipa_path
 
 
@@ -1681,7 +1807,19 @@ def _put_dependencies_blob(endpoint_url, gz_bytes):
     try:
         req = urllib.request.Request(
             endpoint_url, data=gz_bytes,
-            headers={'Content-Type': 'application/octet-stream'},
+            headers={
+                'Content-Type': 'application/octet-stream',
+                # Precise Content-Length so urllib doesn't fall back
+                # to chunked transfer-encoding (which S3 presigned
+                # PUT signatures don't accept — the worker would see
+                # the body but the signature check 403s). The sibling
+                # `_put_timings_blob` and `_put_artifact_blob` both
+                # set this explicitly; this helper used to rely on
+                # urllib's auto-derive which works on most paths but
+                # was inconsistent with the documented S3 signing
+                # posture.
+                'Content-Length': str(len(gz_bytes)),
+            },
             method='PUT',
         )
         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -1806,12 +1944,24 @@ def run_artifact_upload_flow(app_token, endpoint, app_path,
 
     temp_dir = tempfile.mkdtemp(prefix='bugsee-artifact-')
     try:
+        # Resolve Info.plist provenance BEFORE packaging — we want
+        # `package_id` + `version` + `build` on the registration
+        # payload so the back-end's /builds/baseline lookup keys on
+        # the same triple the SDK side uses. Otherwise every fastlane-
+        # registered build lives in its own bucket and the size-trend
+        # chart never finds a delta.
+        bundle_id, plist_version, plist_build = resolve_bundle_info_from_app(app_path)
+        # Caller-supplied args override the plist (a CI step may want
+        # to label a build differently from what Xcode wrote in).
+        effective_version = version or plist_version
+        effective_build = build_number or plist_build
+
         # Sanitise the .ipa filename stem against path-traversal — the
         # bundle id / app name flow from Info.plist values we read but
         # don't fully validate.
-        stem = os.path.basename(app_path)[:-4] or 'build'
-        safe_stem = re.sub(r'[^A-Za-z0-9._-]', '_', stem)
-        ipa_path = os.path.join(temp_dir, '%s.ipa' % safe_stem)
+        stem = bundle_id or os.path.basename(app_path)[:-4] or 'build'
+        safe_stem = re.sub(r'[^A-Za-z0-9._-]', '_', os.path.basename(stem))
+        ipa_path = os.path.join(temp_dir, '%s.ipa' % (safe_stem or 'build'))
         print("Bugsee: packaging %s → %s"
               % (os.path.basename(app_path), ipa_path))
         package_app_as_ipa(app_path, ipa_path)
@@ -1828,23 +1978,46 @@ def run_artifact_upload_flow(app_token, endpoint, app_path,
             'format': 'ipa',
             'request_artifact_upload': bool(request_artifact_upload),
         }
-        if version:
-            payload['version'] = version
-        if build_number:
-            payload['build'] = build_number
+        if bundle_id:
+            # `package_id` is one of the back-end's baseline lookup
+            # keys. Without it the dashboard size-trend chart never
+            # finds a baseline for this build's family.
+            payload['package_id'] = bundle_id
+        if effective_version:
+            payload['version'] = effective_version
+        if effective_build:
+            payload['build'] = effective_build
         if artifact_size > 0:
             payload['artifact_size'] = artifact_size
-        # `_extract_first_dwarf_uuid` reads `options.dsym_folder` from
-        # the module-level OptionParser result, which may not be set
-        # when this flow is invoked outside of `main()` (tests, future
-        # library use). Guard against the NameError and skip the uuid
-        # field — it's optional in the registration payload.
-        try:
-            uuid_str = _extract_first_dwarf_uuid()
-        except NameError:
-            uuid_str = None
-        if uuid_str:
-            payload['uuid'] = uuid_str
+        # $CONFIGURATION is set by Xcode in build phases and by
+        # `xcodebuild` invocations; the second baseline-lookup key
+        # the back-end consumes. Optional — when absent, the back-end
+        # treats it as the implicit "Release" bucket.
+        config = (os.environ.get('CONFIGURATION') or '').strip()
+        if config:
+            payload['build_configuration'] = config
+
+        # `uuid` is the build identifier the back-end uses to join
+        # crashes to this build (`crash.uuid → build`). Resolution
+        # cascade matches the SDK's posture:
+        #   1. Main executable's Mach-O LC_UUID (deterministic per
+        #      linker invocation; the same value the runtime reports).
+        #   2. First dwarf UUID from the legacy dSYM scan (when the
+        #      fastlane lane runs the dSYM upload action in the same
+        #      invocation, options.dsym_folder is set).
+        #   3. uuid.uuid4() — pure random fallback. The build record
+        #      is still useful for the size-trend chart but crash-
+        #      to-build join is best-effort in this case.
+        build_uuid = _extract_uuid_from_app(app_path)
+        if not build_uuid:
+            try:
+                build_uuid = _extract_first_dwarf_uuid()
+            except NameError:
+                build_uuid = None
+        if not build_uuid:
+            build_uuid = str(uuid.uuid4())
+        payload['uuid'] = build_uuid
+
         # VCS metadata (best-effort). Resolves via bugsee-cli when on
         # PATH, falls back to in-process Python otherwise. Guard
         # against the same `options`-NameError window as the dSYM
@@ -1943,7 +2116,14 @@ def _run_dependencies_pipeline(app_token, project_root):
         return False
 
     body = _collect_build_metadata()
-    body["uuid"] = _extract_first_dwarf_uuid()
+    # Guard against writing `"uuid": null` into the POST body when the
+    # dSYM scan yields nothing (e.g. a lane that ships build-info-only
+    # with no dSYMs alongside). The historic assignment unconditionally
+    # set the value, leaking the None into the JSON. Mirrors the
+    # artifact-upload-flow pattern in this same file.
+    dwarf_uuid = _extract_first_dwarf_uuid()
+    if dwarf_uuid:
+        body["uuid"] = dwarf_uuid
     body["request_artifact_upload"]      = False
     body["request_dependencies_upload"]  = have_deps
     body["request_timings_upload"]       = timings_gz is not None

@@ -50,7 +50,8 @@ module Fastlane
     #         "dsym_upload":      true | false,
     #         "deps_collection":  true | false,
     #         "timings":          true | false,
-    #         "size_analysis":    true | false
+    #         "size_analysis":    true | false,
+    #         "artifact_upload":  true | false
     #       }
     #     }
     #
@@ -100,6 +101,7 @@ module Fastlane
         deps_collection
         timings
         size_analysis
+        artifact_upload
       ].freeze
 
       # Filesystem glob patterns for locating manifests. The list

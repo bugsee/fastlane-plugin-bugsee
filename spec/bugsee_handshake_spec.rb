@@ -314,6 +314,7 @@ describe Fastlane::Bugsee::Handshake do
         deps_collection
         timings
         size_analysis
+        artifact_upload
       ])
     end
   end

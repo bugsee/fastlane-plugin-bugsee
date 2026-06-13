@@ -103,6 +103,45 @@ All four branches produce a UUID the SDK can independently reproduce, so server-
 
 The action `is_supported?(:android)` only.
 
+## iOS artefact upload (size analysis)
+
+This plugin also exposes an `upload_artifact_to_bugsee` action that packages a built `.app` into a byte-deterministic synthetic `.ipa` and uploads it to Bugsee for size analysis. The canonical path remains the [Bugsee iOS SDK](https://github.com/bugsee/bugsee-ios)'s `tools.bundle/BugseeAgent` build phase, which runs size analysis automatically when `BUGSEE_BUILD_INFO_ENABLED` is on (default). Reach for this fastlane action only when one of the following applies:
+
+- **Your CI doesn't integrate the SDK's build phase.** Binary-only CI, alternative build systems (Bazel, Tuist with custom phases), or pipelines that pre-build the `.app` and only invoke fastlane for publish.
+- **Your CI splits build (no token) from publish (production token).** The build machine produces the `.app` or `.xcarchive`; the publish machine runs this action with the production token.
+- **You want the size-trend chart without shipping bytes.** Pass `build_info_only: true` to record `artifact_size` on the server (so the dashboard's size-trend chart works) without uploading the `.ipa` bytes themselves. Useful for firewalled CI and privacy-sensitive setups.
+
+If the SDK's build phase already runs in the same Xcode build, the action's cross-producer handshake skips by default (the SDK writes a manifest at `build/bugsee/build-actions.json`; the action reads it and short-circuits when `artifact_upload: true`). Pass `force: true` to override.
+
+Example invocation:
+
+```ruby
+upload_artifact_to_bugsee(
+  app_token:      ENV["BUGSEE_APP_TOKEN"],
+  xcarchive_path: ENV["XCARCHIVE_PATH"],
+  # OR pass the .app directly:
+  # app_path:     "build/Products/Release-iphoneos/MyApp.app",
+  # Optional:
+  # version:          "1.2.3",   # CFBundleShortVersionString (else read from Info.plist)
+  # build:            "42",      # CFBundleVersion              (else read from Info.plist)
+  # build_info_only:  true,      # record size, skip the .ipa bytes upload
+  # force:            true,      # override the cross-producer handshake skip
+)
+```
+
+**App path resolution:**
+
+1. Explicit `:app_path` if passed.
+2. `:xcarchive_path` → the single `.app` under `<archive>/Products/Applications/`. Multiple `.app` siblings raise a `user_error` so the user can disambiguate.
+
+**Env var aliases** (all are also exposed via fastlane's `available_options`):
+
+- `BUGSEE_APP_TOKEN`, `BUGSEE_APP_PATH`, `BUGSEE_XCARCHIVE_PATH`
+- `BUGSEE_APP_VERSION`, `BUGSEE_APP_BUILD`
+- `BUGSEE_BUILD_INFO_ONLY`, `BUGSEE_FORCE`
+
+The action `is_supported?(:ios)` only.
+
 ## Documentation
 
 Further documentation about Bugsee crash symbolication is available at https://docs.bugsee.com
