@@ -1722,6 +1722,157 @@ def _put_timings_blob(url, gz_bytes, debug=False):
     return False
 
 
+def _put_artifact_blob(url, ipa_path, debug=False):
+    """Best-effort PUT of the .ipa bytes to the presigned
+    `endpoint` the metadata POST returned.
+
+    Streams from disk instead of slurping into memory — modern iOS
+    apps can exceed 300 MB once extensions + assets are included,
+    and macOS CI runners have modest memory budgets.
+
+    `Content-Type` is hard-set to `application/octet-stream`
+    (matches the SDK BugseeAgent's upload_build posture; the
+    back-end signs the presigned URL over exactly that content
+    type, so S3 403s on any mismatch). `Content-Length` is
+    pre-computed because urllib's default chunked transfer-encoding
+    breaks S3 presigned PUT signatures.
+    """
+    if not url or not ipa_path:
+        return False
+    try:
+        ipa_size = os.path.getsize(ipa_path)
+    except OSError as e:
+        print("Bugsee: could not stat artefact for upload: %s" % e)
+        return False
+    try:
+        with open(ipa_path, 'rb') as fp:
+            put_req = urllib.request.Request(url, data=fp, method='PUT')
+            put_req.add_header('Content-Length', str(ipa_size))
+            put_req.add_header('Content-Type', 'application/octet-stream')
+            with urllib.request.urlopen(put_req, timeout=600) as resp:
+                status = resp.status
+    except urllib.error.HTTPError as e:
+        print("Bugsee: artefact PUT failed (HTTP %d)" % e.code)
+        return False
+    except Exception as e:
+        print("Bugsee: artefact PUT network error: %s" % e)
+        return False
+
+    if 200 <= status < 300:
+        if debug:
+            print("Bugsee: artefact uploaded (%d bytes, HTTP %d)"
+                  % (ipa_size, status))
+        return True
+    print("Bugsee: artefact PUT unexpected status: %d" % status)
+    return False
+
+
+def run_artifact_upload_flow(app_token, endpoint, app_path,
+                             version=None, build_number=None,
+                             request_artifact_upload=True,
+                             debug=False):
+    """Package an `.app` into a synthetic `.ipa` and upload it to
+    Bugsee for size analysis. Mirrors the SDK BugseeAgent's
+    `run_size_analysis_flow` minus the chunked-upload opt-in and
+    the in-build size-check evaluation (those can land in a
+    follow-up).
+
+    Returns True on overall success (build registered AND, when
+    requested, artefact bytes shipped); False on any failure.
+
+    `request_artifact_upload=False` flips this into a build-info-
+    only registration that records the artefact_size on the
+    server WITHOUT shipping the bytes — useful for firewalled CI
+    or privacy-sensitive setups where the dashboard's size-trend
+    chart is enough.
+    """
+    if not app_path or not os.path.isdir(app_path):
+        print("Bugsee: --app-path is required and must be a directory; got %r"
+              % app_path)
+        return False
+    if not app_path.endswith('.app'):
+        print("Bugsee: --app-path must end in .app; got %r" % app_path)
+        return False
+
+    temp_dir = tempfile.mkdtemp(prefix='bugsee-artifact-')
+    try:
+        # Sanitise the .ipa filename stem against path-traversal — the
+        # bundle id / app name flow from Info.plist values we read but
+        # don't fully validate.
+        stem = os.path.basename(app_path)[:-4] or 'build'
+        safe_stem = re.sub(r'[^A-Za-z0-9._-]', '_', stem)
+        ipa_path = os.path.join(temp_dir, '%s.ipa' % safe_stem)
+        print("Bugsee: packaging %s → %s"
+              % (os.path.basename(app_path), ipa_path))
+        package_app_as_ipa(app_path, ipa_path)
+
+        try:
+            artifact_size = os.path.getsize(ipa_path)
+        except OSError:
+            artifact_size = 0
+
+        # Build the registration payload. Mirrors the SDK's
+        # `run_size_analysis_flow` payload shape so the back-end's
+        # `_register_build` route treats both producers identically.
+        payload = {
+            'format': 'ipa',
+            'request_artifact_upload': bool(request_artifact_upload),
+        }
+        if version:
+            payload['version'] = version
+        if build_number:
+            payload['build'] = build_number
+        if artifact_size > 0:
+            payload['artifact_size'] = artifact_size
+        # `_extract_first_dwarf_uuid` reads `options.dsym_folder` from
+        # the module-level OptionParser result, which may not be set
+        # when this flow is invoked outside of `main()` (tests, future
+        # library use). Guard against the NameError and skip the uuid
+        # field — it's optional in the registration payload.
+        try:
+            uuid_str = _extract_first_dwarf_uuid()
+        except NameError:
+            uuid_str = None
+        if uuid_str:
+            payload['uuid'] = uuid_str
+        # VCS metadata (best-effort). Resolves via bugsee-cli when on
+        # PATH, falls back to in-process Python otherwise. Guard
+        # against the same `options`-NameError window as the dSYM
+        # UUID extraction above (resolve_vcs_metadata's CLI path may
+        # consult `options.cli_path` / `options.cli_version`).
+        try:
+            vcs = resolve_vcs_metadata(os.getcwd())
+        except NameError:
+            vcs = None
+        if vcs:
+            payload['vcs'] = vcs
+
+        if debug:
+            print("Bugsee: artefact registration payload = %s"
+                  % json.dumps(payload))
+
+        result = _request_build_registration(
+            app_token, endpoint, json.dumps(payload))
+        if result is None:
+            return False
+
+        if not request_artifact_upload:
+            # Build-info-only path: nothing more to ship. The server
+            # recorded artifact_size for the size-trend chart.
+            if debug:
+                print("Bugsee: build-info-only registration complete")
+            return True
+
+        presigned = result.get('endpoint') if isinstance(result, dict) else None
+        if not presigned:
+            print("Bugsee: build registration returned no presigned endpoint")
+            return False
+
+        return _put_artifact_blob(presigned, ipa_path, debug=debug)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 def _run_dependencies_pipeline(app_token, project_root):
     """Top-level driver wired into [main] when --deps is enabled.
 
@@ -3098,6 +3249,29 @@ if __name__ == "__main__":
                   help="Optional launcher-icon PNG path. Forwarded "
                        "to bugsee-cli's --icon flag for "
                        "--type proguard uploads.")
+    parser.add_option("--upload-artifact", dest="upload_artifact",
+                  action="store_true", default=False,
+                  help="iOS artifact-upload flow. Packages the .app "
+                       "at --app-path into a synthetic .ipa and "
+                       "uploads it to the back-end for size analysis. "
+                       "Short-circuits the dSYM / deps / timings "
+                       "pipeline. Used by the upload_artifact_to_bugsee "
+                       "fastlane action.")
+    parser.add_option("--app-path", dest="app_path",
+                  default=None,
+                  help="Path to the built `.app` directory. Required "
+                       "by --upload-artifact. Typically resolved by "
+                       "the fastlane action from xcarchive_path + "
+                       "Products/Applications/<App>.app or from "
+                       "TARGET_BUILD_DIR/WRAPPER_NAME.")
+    parser.add_option("--request-artifact-upload", dest="request_artifact_upload",
+                  action="store_true", default=False,
+                  help="Set the build registration payload's "
+                       "`request_artifact_upload` field to true. "
+                       "Implied by --upload-artifact; expose "
+                       "separately so a future build-info-only "
+                       "caller can request size analysis without "
+                       "actually shipping the artefact bytes.")
     (options, args) = parser.parse_args()
 
     # ──────────────────────────────────────────────
@@ -3157,6 +3331,43 @@ if __name__ == "__main__":
             exit(0)
         else:
             print("Bugsee: mapping upload failed")
+            exit(1)
+
+    # ──────────────────────────────────────────────
+    # iOS artefact upload — short-circuit path
+    # ──────────────────────────────────────────────
+    # Runs BEFORE the from_xcode daemonization fork so the artefact
+    # upload is fully synchronous from the caller's perspective (the
+    # Ruby action's Actions.sh blocks on completion). Skips:
+    #   - the iOS dSYM upload flow (orthogonal, has its own action)
+    #   - the deps/timings pipeline (those have their own
+    #     handshake-gated entry path)
+    #   - the daemonization double-fork (the fastlane lane wants to
+    #     block on the upload — the post-action daemon is an iOS
+    #     SDK BugseeAgent-only concern)
+    if options.upload_artifact:
+        if not options.app_path:
+            print("Bugsee: --upload-artifact requires --app-path")
+            exit(1)
+        if not os.path.isdir(options.app_path):
+            print("Bugsee: --app-path does not exist or is not a "
+                  "directory: %s" % options.app_path)
+            exit(1)
+        if not options.app_path.endswith('.app'):
+            print("Bugsee: --app-path must end in .app: %s"
+                  % options.app_path)
+            exit(1)
+        ok = run_artifact_upload_flow(
+            APP_TOKEN, options.endpoint, options.app_path,
+            version=options.version,
+            build_number=options.build,
+            request_artifact_upload=True,
+        )
+        if ok:
+            print("Bugsee: artefact uploaded successfully")
+            exit(0)
+        else:
+            print("Bugsee: artefact upload failed")
             exit(1)
 
     if options.from_xcode:
