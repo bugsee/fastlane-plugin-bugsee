@@ -214,6 +214,38 @@ class TestRunArtifactUploadFlowHappyPath(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(captured, ['POST'])
 
+    def test_build_info_only_with_artifact_size_sent_but_no_put(self):
+        # End-to-end pin for `--build-info-only` (Tier 3 follow-up).
+        # The registration POST must still carry `artifact_size`
+        # (so the dashboard's size-trend chart works), and
+        # `request_artifact_upload` must be False, and the helper
+        # must NOT attempt a PUT.
+        captured_body = []
+        captured_methods = []
+
+        def fake_urlopen(req, timeout=None):
+            captured_methods.append(req.get_method())
+            if 'apps/' in req.full_url:
+                captured_body.append(json.loads(req.data.decode('utf-8')))
+                return _FakeHttpResponse(body=_ok_envelope())
+            return _FakeHttpResponse(status=200)
+
+        with mock.patch('urllib.request.urlopen', side_effect=fake_urlopen):
+            ok = agent.run_artifact_upload_flow(
+                'app-token', 'https://api.bugsee.com', self.app,
+                version='1.2.3', build_number='42',
+                request_artifact_upload=False,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(captured_methods, ['POST'])
+        self.assertEqual(len(captured_body), 1)
+        payload = captured_body[0]
+        # Size IS still recorded (the dashboard size-trend uses this).
+        self.assertIn('artifact_size', payload)
+        self.assertGreater(payload['artifact_size'], 0)
+        # request_artifact_upload IS False so the server signs no PUT URL.
+        self.assertEqual(payload['request_artifact_upload'], False)
+
     def test_registration_failure_returns_false_without_put(self):
         # Registration POST fails (e.g. invalid token). We MUST NOT
         # attempt the PUT — there's no presigned URL to PUT to.

@@ -82,6 +82,12 @@ describe Fastlane::Actions::UploadArtifactToBugseeAction do
       item = described_class.available_options.find { |o| o.key == :force }
       expect(item.default_value).to be false
     end
+
+    it 'exposes build_info_only (default false, boolean)' do
+      expect(keys).to include(:build_info_only)
+      item = described_class.available_options.find { |o| o.key == :build_info_only }
+      expect(item.default_value).to be false
+    end
   end
 
   # ──────────────────────────────────────────────────────────────
@@ -216,6 +222,33 @@ describe Fastlane::Actions::UploadArtifactToBugseeAction do
         cmd = sh_capture.first
         expect(cmd).not_to include(' -v ')
         expect(cmd).not_to include(' -b ')
+      end
+    end
+
+    it 'passes --build-info-only when build_info_only: true' do
+      Dir.mktmpdir do |tmp|
+        app = make_app(tmp)
+        described_class.run(
+          app_token: 'tok',
+          app_path: app,
+          agent_path: agent_path,
+          build_info_only: true,
+          force: true,
+        )
+        expect(sh_capture.first).to include('--build-info-only')
+      end
+    end
+
+    it 'omits --build-info-only when the flag is unset (default: ship bytes)' do
+      Dir.mktmpdir do |tmp|
+        app = make_app(tmp)
+        described_class.run(
+          app_token: 'tok',
+          app_path: app,
+          agent_path: agent_path,
+          force: true,
+        )
+        expect(sh_capture.first).not_to include('--build-info-only')
       end
     end
 

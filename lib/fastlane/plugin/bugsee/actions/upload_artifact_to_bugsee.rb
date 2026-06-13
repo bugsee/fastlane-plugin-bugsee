@@ -95,6 +95,12 @@ module Fastlane
         cmd << "-b #{build.to_s.shellescape}"   if build   && !build.to_s.empty?
         cmd << "--upload-artifact"
         cmd << "--app-path #{app_path.shellescape}"
+        # When build_info_only is true, skip the .ipa bytes upload —
+        # the registration POST still records artifact_size on the
+        # server so the dashboard's size-trend chart works, but the
+        # bytes never leave the build host. Useful for firewalled CI
+        # and privacy-sensitive setups.
+        cmd << "--build-info-only" if params[:build_info_only]
         cmd << app_token.shellescape
 
         begin
@@ -196,6 +202,12 @@ module Fastlane
           FastlaneCore::ConfigItem.new(key: :build,
                                        env_name: "BUGSEE_APP_BUILD",
                                        description: "CFBundleVersion (e.g. \"42\"). Optional — read from Info.plist by BugseeAgent if absent",
+                                       optional: true),
+          FastlaneCore::ConfigItem.new(key: :build_info_only,
+                                       env_name: "BUGSEE_BUILD_INFO_ONLY",
+                                       description: "When true, register the build (records artifact_size for the size-trend chart) but skip shipping the .ipa bytes. Useful for firewalled CI and privacy-sensitive setups",
+                                       is_string: false,
+                                       default_value: false,
                                        optional: true),
           FastlaneCore::ConfigItem.new(key: :force,
                                        env_name: "BUGSEE_FORCE",

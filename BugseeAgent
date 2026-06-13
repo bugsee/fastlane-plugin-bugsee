@@ -3282,6 +3282,16 @@ if __name__ == "__main__":
                        "separately so a future build-info-only "
                        "caller can request size analysis without "
                        "actually shipping the artefact bytes.")
+    parser.add_option("--build-info-only", dest="build_info_only",
+                  action="store_true", default=False,
+                  help="Inverse of --request-artifact-upload. With "
+                       "--upload-artifact, this flips the flow into "
+                       "register-only mode: the registration POST "
+                       "still records `artifact_size` on the server "
+                       "(so the dashboard's size-trend chart works) "
+                       "but the .ipa bytes never leave the build "
+                       "host. Useful for firewalled CI and privacy-"
+                       "sensitive setups.")
     (options, args) = parser.parse_args()
 
     # ──────────────────────────────────────────────
@@ -3367,11 +3377,14 @@ if __name__ == "__main__":
             print("Bugsee: --app-path must end in .app: %s"
                   % options.app_path)
             exit(1)
+        # `--build-info-only` flips the flow into register-only
+        # mode (records artifact_size, ships no bytes). The agent's
+        # default is byte-shipping (request_artifact_upload=True).
         ok = run_artifact_upload_flow(
             APP_TOKEN, options.endpoint, options.app_path,
             version=options.version,
             build_number=options.build,
-            request_artifact_upload=True,
+            request_artifact_upload=not options.build_info_only,
         )
         if ok:
             print("Bugsee: artefact uploaded successfully")
