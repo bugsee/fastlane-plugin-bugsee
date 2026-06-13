@@ -1340,6 +1340,90 @@ def _collect_build_metadata():
     return body
 
 
+# -----------------------------------------------------------------
+# Artifact packaging (synthetic .ipa from `.app`)
+# -----------------------------------------------------------------
+
+# File extensions that are already compressed; storing them with
+# DEFLATE wastes CPU without saving bytes. Mirrors the SDK
+# BugseeAgent's (`tools.bundle/BugseeAgent::_IPA_STORE_EXTENSIONS`)
+# and the Android Gradle plugin's `BundleZipNormalizer` set. Keep in
+# sync — divergence would make the byte-deterministic IPA dedup that
+# the back-end relies on break across producers.
+_IPA_STORE_EXTENSIONS = (
+    # Image / video / audio
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff", ".webp", ".heic",
+    ".mp4", ".mov", ".m4v", ".avi", ".webm",
+    ".mp3", ".m4a", ".aac", ".ogg", ".flac", ".wav",
+    # Archive / asset-catalog / package formats
+    ".zip", ".gz", ".bz2", ".xz", ".7z",
+    ".car",  # Asset catalog
+    ".pdf",
+    # Compiled fonts + binary glyph caches
+    ".woff", ".woff2", ".otf", ".ttf",
+)
+
+# MS-DOS date/time epoch is 1980-01-01; picking a fixed value gives
+# the zip a stable mtime across rebuilds so two archives of identical
+# bits produce byte-identical synthetic IPAs. Mirrors the SDK side
+# (`tools.bundle/BugseeAgent::_IPA_FIXED_MTIME`) and the Android
+# Gradle plugin's `DOS_EPOCH_LOCAL`.
+_IPA_FIXED_MTIME = (1980, 1, 1, 0, 0, 0)
+
+
+def package_app_as_ipa(app_path, output_ipa_path):
+    """Zip `<App>.app` as `Payload/<App>.app/...` into an .ipa.
+
+    Byte-deterministic — entries sorted by name, mtimes pinned. Two
+    runs over the same source tree produce hash-identical output, so
+    the back-end can dedupe re-uploads by content sha. Compression
+    method per-entry: STORE (no recompression) for already-compressed
+    formats (PNG/JPG/MP4/.car/...), DEFLATE for plists / strings /
+    Mach-O / etc. Same posture as the SDK BugseeAgent's
+    `package_app_as_ipa` so artefacts produced by either producer
+    are interchangeable on the back-end.
+
+    DOES NOT add iTunesMetadata.plist or code signing — neither is
+    needed for size analysis (the back-end's `_analyze_bundle` walks
+    `Payload/*.app` and runs the categorisation heuristics off the
+    Mach-O + resource tree only).
+    """
+    with zipfile.ZipFile(output_ipa_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(app_path):
+            # Sort in place so `os.walk` traverses in a deterministic
+            # order — filesystem enumeration is otherwise non-
+            # deterministic (and differs between APFS / HFS+ / NFS).
+            dirs.sort()
+            files.sort()
+            for f in files:
+                src = os.path.join(root, f)
+                if os.path.islink(src):
+                    # Real IPAs don't carry symlinks; zipfile can't
+                    # encode them; skip.
+                    continue
+                rel = os.path.relpath(src, os.path.dirname(app_path))
+                arcname = os.path.join('Payload', rel)
+                method = (
+                    zipfile.ZIP_STORED
+                    if f.lower().endswith(_IPA_STORE_EXTENSIONS)
+                    else zipfile.ZIP_DEFLATED
+                )
+                info = zipfile.ZipInfo(filename=arcname, date_time=_IPA_FIXED_MTIME)
+                info.compress_type = method
+                # Preserve POSIX exec bits on the embedded Mach-O —
+                # otherwise the archive encodes as plain data and the
+                # back-end's executable-detection heuristics (e.g.
+                # "is this the main binary?") lose a signal.
+                try:
+                    st_mode = os.stat(src).st_mode
+                    info.external_attr = (st_mode & 0xFFFF) << 16
+                except OSError:
+                    pass
+                with open(src, 'rb') as fp:
+                    zf.writestr(info, fp.read())
+    return output_ipa_path
+
+
 def _extract_first_dwarf_uuid():
     """Scan the dSYM folder for the FIRST Mach-O UUID we can find
     via dwarfdump. The Android plugin sends a single per-build

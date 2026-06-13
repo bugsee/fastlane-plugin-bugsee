@@ -28,10 +28,12 @@ import importlib.util
 import importlib.machinery
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import textwrap
 import unittest
+import zipfile
 
 
 # Load the BugseeAgent file as a module. The file has no .py
@@ -728,6 +730,137 @@ class TestBuildDependenciesPayload(unittest.TestCase):
 # ──────────────────────────────────────────────
 # Gzip / wire serialisation
 # ──────────────────────────────────────────────
+
+class TestPackageAppAsIpa(unittest.TestCase):
+    """Pin the byte-deterministic synthetic .ipa packaging.
+
+    The back-end dedupes re-uploads by content sha; two runs over the
+    same source tree MUST produce hash-identical output, otherwise
+    the dedup misses and storage costs balloon. Mirrors the SDK
+    BugseeAgent's `TestPackageAppAsIpa` so both producers stay
+    byte-equivalent."""
+
+    def _make_app(self):
+        tmp = tempfile.mkdtemp()
+        app = os.path.join(tmp, 'Foo.app')
+        os.makedirs(app)
+        # A plist-shaped Info.plist (DEFLATEd in the archive).
+        with open(os.path.join(app, 'Info.plist'), 'w') as f:
+            f.write('<plist><dict><key>X</key><string>Y</string></dict></plist>')
+        # A pre-compressed asset (STOREd).
+        with open(os.path.join(app, 'icon.png'), 'wb') as f:
+            f.write(b'\x89PNG\r\n\x1a\n' + b'\x00' * 32)
+        # An executable Mach-O stub — POSIX exec bits must survive.
+        exe = os.path.join(app, 'Foo')
+        with open(exe, 'wb') as f:
+            f.write(b'macho-stub')
+        os.chmod(exe, 0o755)
+        # A nested directory to exercise os.walk ordering.
+        sub = os.path.join(app, 'Frameworks', 'B.framework')
+        os.makedirs(sub)
+        with open(os.path.join(sub, 'B'), 'wb') as f:
+            f.write(b'b-binary')
+        return tmp, app
+
+    def test_produces_payload_prefix_arcnames(self):
+        # Every entry must be under `Payload/<App>.app/...`. Pre-fix
+        # a stray `os.path.join('Payload', ...)` on the wrong relpath
+        # would land entries at the archive root, breaking the
+        # back-end's `_analyze_bundle` walk.
+        tmp, app = self._make_app()
+        try:
+            ipa = os.path.join(tmp, 'Foo.ipa')
+            agent.package_app_as_ipa(app, ipa)
+            with zipfile.ZipFile(ipa, 'r') as zf:
+                names = zf.namelist()
+            self.assertTrue(names, 'archive must not be empty')
+            for n in names:
+                self.assertTrue(
+                    n.startswith('Payload/Foo.app/'),
+                    'entry outside Payload/<App>.app/: %r' % n,
+                )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_is_byte_deterministic_across_runs(self):
+        # Two archives of the same source tree must hash identically.
+        # Catches: filesystem-order non-determinism, current-time
+        # mtimes, or any other accidental injection of run-state.
+        tmp, app = self._make_app()
+        try:
+            ipa_a = os.path.join(tmp, 'a.ipa')
+            ipa_b = os.path.join(tmp, 'b.ipa')
+            agent.package_app_as_ipa(app, ipa_a)
+            agent.package_app_as_ipa(app, ipa_b)
+            with open(ipa_a, 'rb') as fa, open(ipa_b, 'rb') as fb:
+                self.assertEqual(
+                    fa.read(), fb.read(),
+                    'package_app_as_ipa must produce byte-identical output',
+                )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_skips_symlinks(self):
+        # Real IPAs don't carry symlinks; zipfile can't encode them
+        # without using non-standard extra fields. Skip them.
+        tmp, app = self._make_app()
+        try:
+            link_target = os.path.join(app, 'Info.plist')
+            link_src = os.path.join(app, 'InfoLink.plist')
+            os.symlink(link_target, link_src)
+            ipa = os.path.join(tmp, 'Foo.ipa')
+            agent.package_app_as_ipa(app, ipa)
+            with zipfile.ZipFile(ipa, 'r') as zf:
+                names = zf.namelist()
+            self.assertNotIn('Payload/Foo.app/InfoLink.plist', names,
+                             'symlink must be skipped, got: %r' % names)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_uses_store_for_already_compressed_extensions(self):
+        # PNG / MP4 / etc. are pre-compressed; recompressing wastes
+        # CPU without saving bytes. Pin per-entry compression method.
+        tmp, app = self._make_app()
+        try:
+            ipa = os.path.join(tmp, 'Foo.ipa')
+            agent.package_app_as_ipa(app, ipa)
+            with zipfile.ZipFile(ipa, 'r') as zf:
+                by_name = {i.filename: i for i in zf.infolist()}
+            png = by_name.get('Payload/Foo.app/icon.png')
+            self.assertIsNotNone(png, 'icon.png missing from archive')
+            self.assertEqual(
+                png.compress_type, zipfile.ZIP_STORED,
+                'pre-compressed PNG must use STORE, not DEFLATE',
+            )
+            # Plain plist still uses DEFLATE — the negative-pin
+            # companion to the STORE pin above.
+            plist = by_name.get('Payload/Foo.app/Info.plist')
+            self.assertIsNotNone(plist)
+            self.assertEqual(plist.compress_type, zipfile.ZIP_DEFLATED)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_preserves_executable_bits_on_mach_o(self):
+        # The back-end's "is this the main binary?" heuristic uses
+        # the POSIX exec bits stored in `external_attr`. Without
+        # preservation, every embedded executable encodes as plain
+        # data and the heuristic loses signal.
+        tmp, app = self._make_app()
+        try:
+            ipa = os.path.join(tmp, 'Foo.ipa')
+            agent.package_app_as_ipa(app, ipa)
+            with zipfile.ZipFile(ipa, 'r') as zf:
+                by_name = {i.filename: i for i in zf.infolist()}
+            exe = by_name.get('Payload/Foo.app/Foo')
+            self.assertIsNotNone(exe, 'main exe missing from archive')
+            mode = (exe.external_attr >> 16) & 0xFFFF
+            self.assertTrue(
+                mode & 0o100,
+                'owner-exec bit must survive; got mode=%o' % mode,
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 class TestGzipJsonBytes(unittest.TestCase):
     def test_round_trips_through_gzip_decompress(self):
