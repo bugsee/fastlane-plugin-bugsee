@@ -700,6 +700,30 @@ class TestBuildDependenciesPayload(unittest.TestCase):
         self.assertEqual(third['name'], 'NoVer')
         self.assertNotIn('version', third)
 
+    def test_blob_preserves_url_when_entry_carries_one(self):
+        # Cross-language wire-shape pin. CLI-on path → entry dict
+        # has `url`; pre-fix, the per-entry whitelist at this site
+        # silently dropped url before gzip → SPM vuln-scan coverage
+        # permanently degraded vs the SDK-side blob shape (which
+        # uses `dependencies: entries` verbatim and preserves url).
+        with_url = self._entry('Alamofire')
+        with_url['url'] = 'https://github.com/Alamofire/Alamofire.git'
+        without_url = self._entry('SocketRocket')
+        _, blob = agent._build_dependencies_payload(
+            [with_url, without_url], truncated=False, scope_label='all',
+            clock=lambda: 0,
+        )
+        deps = {d['name']: d for d in blob['dependencies']}
+        # Present on the entry → must round-trip into the blob.
+        self.assertEqual(
+            deps['Alamofire'].get('url'),
+            'https://github.com/Alamofire/Alamofire.git',
+        )
+        # Absent on the entry → must NOT appear as `url: None`.
+        # Mirrors the Rust DepEntry's
+        # `#[serde(skip_serializing_if = "Option::is_none")]`.
+        self.assertNotIn('url', deps['SocketRocket'])
+
 
 # ──────────────────────────────────────────────
 # Gzip / wire serialisation

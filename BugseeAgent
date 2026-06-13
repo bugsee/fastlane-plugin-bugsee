@@ -760,6 +760,14 @@ def _build_dependencies_payload(entries, truncated, scope_label,
             item["scope"] = e["scope"]
         if e.get("parents"):
             item["parents"] = list(e["parents"])
+        # SPM `url` (load-bearing for OSV's SwiftURL vuln lookups).
+        # Mirrors the Rust `DepEntry::url` field's
+        # `#[serde(skip_serializing_if = "Option::is_none")]`. Without
+        # this, fastlane Python-fallback uploads would emit
+        # url-less blobs even when the CLI populated url, silently
+        # degrading vuln-scan coverage vs the SDK-side blob shape.
+        if e.get("url"):
+            item["url"] = e["url"]
         serialised.append(item)
 
     blob = {
