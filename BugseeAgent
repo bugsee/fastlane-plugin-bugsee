@@ -57,6 +57,24 @@ import fnmatch
 
 BUGSEE_CLI_DEFAULT_VERSION = "0.1.1"
 BUGSEE_CLI_DOWNLOAD_BASE = "https://download.bugsee.com/cli"
+# Strict version-string shape: SemVer-ish `<major>.<minor>.<patch>`
+# optionally followed by `-<prerelease>`. This regex gates any value
+# that flows into the download URL or the on-disk cache directory
+# path, so a malicious BUGSEE_CLI_VERSION env var cannot inject `/` or
+# `..` segments to escape the cache root or redirect downloads.
+_BUGSEE_CLI_VERSION_RE = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$')
+
+# Exception tuple every CLI-shelling helper catches. Pinned in one
+# place so all of `_resolve_*_via_cli` / `_collect_*_via_cli` /
+# `_parse_*_via_cli` follow the same fallback policy:
+#   - OSError: subprocess exec failure, pipe close, broken file handle
+#   - ValueError: malformed JSON from CLI stdout
+#   - TypeError: defensive — subprocess.run mocked in tests can return
+#     MagicMock objects that explode in json.loads (this is the
+#     bite the dsym helper hit during TestParseDSYM hardening)
+#   - subprocess.CalledProcessError: a side_effect in test mocks that
+#     raise rather than return a fake CompletedProcess
+_CLI_CATCHALL_EXCEPTIONS = (OSError, ValueError, TypeError, subprocess.CalledProcessError)
 
 
 def detectHostTriple():
@@ -83,11 +101,38 @@ def detectHostTriple():
     return None
 
 
+_resolveCli_cache = {}
+
+
 def resolveCli(cliPath=None, cliVersion=None):
     """Return path to a usable bugsee-cli binary, or None.
     Precedence: explicit cliPath > BUGSEE_CLI_PATH env > auto-download.
     Returning None is a soft failure — caller should fall back / skip.
+
+    Result is memoized by `(cliPath, cliVersion, BUGSEE_CLI_PATH env,
+    BUGSEE_CLI_VERSION env)` for the lifetime of the process. The
+    plugin invokes this once per CLI helper (8+ times per build) and
+    the resolve path includes filesystem walks (cache hit check,
+    network-side artefact-existence check) — caching the first
+    success/failure avoids the per-call cost. The env vars are part
+    of the key because a CI step could (in principle) flip them mid-
+    run; the cliPath/cliVersion args ARE typically constant per call
+    site but vary across helpers, so include them too.
     """
+    cache_key = (
+        cliPath,
+        cliVersion,
+        os.environ.get("BUGSEE_CLI_PATH"),
+        os.environ.get("BUGSEE_CLI_VERSION"),
+    )
+    if cache_key in _resolveCli_cache:
+        return _resolveCli_cache[cache_key]
+    result = _resolveCli_uncached(cliPath, cliVersion)
+    _resolveCli_cache[cache_key] = result
+    return result
+
+
+def _resolveCli_uncached(cliPath=None, cliVersion=None):
     explicit = cliPath or os.environ.get("BUGSEE_CLI_PATH")
     if explicit:
         if os.path.isfile(explicit) and os.access(explicit, os.X_OK):
@@ -95,6 +140,16 @@ def resolveCli(cliPath=None, cliVersion=None):
         print("Bugsee: --cli-path %s is not an executable file; trying auto-download" % explicit)
 
     version = cliVersion or os.environ.get("BUGSEE_CLI_VERSION") or BUGSEE_CLI_DEFAULT_VERSION
+    # Strict version-string validation BEFORE the value flows into the
+    # download URL and the on-disk cache path. Without this, anyone who
+    # can set BUGSEE_CLI_VERSION (a malicious CI step, a poisoned .env,
+    # a Gemfile post_install) could land the cached binary at e.g.
+    # `~/.bugsee/cli/../../malicious_dir/<triple>/bugsee-cli` (path
+    # traversal) or redirect the download to a sibling release URL
+    # via injected path segments.
+    if not _BUGSEE_CLI_VERSION_RE.fullmatch(version):
+        print("Bugsee: rejecting BUGSEE_CLI_VERSION=%r — must match X.Y.Z[-prerelease]" % version)
+        return None
     triple = detectHostTriple()
     if triple is None:
         print("Bugsee: no published bugsee-cli for host %s/%s; skipping CLI upload" % (
@@ -850,7 +905,7 @@ def _resolve_machine_label_via_cli():
             return None
         out = (result.stdout or "").strip()
         return out if out else None
-    except OSError:
+    except _CLI_CATCHALL_EXCEPTIONS:
         return None
 
 
@@ -968,7 +1023,7 @@ def _resolve_vcs_metadata_via_cli(cli_binary, working_dir):
         if not out:
             return None
         return json.loads(out)
-    except (OSError, ValueError):
+    except _CLI_CATCHALL_EXCEPTIONS:
         return None
 
 
@@ -1106,7 +1161,7 @@ def _resolve_xcode_version_via_cli():
             return None
         out = (result.stdout or "").strip()
         return out if out else None
-    except OSError:
+    except _CLI_CATCHALL_EXCEPTIONS:
         return None
 
 
@@ -1177,7 +1232,7 @@ def _read_info_plist_via_cli(plist_path):
         if not out:
             return None
         return json.loads(out)
-    except (OSError, ValueError):
+    except _CLI_CATCHALL_EXCEPTIONS:
         return None
 
 
@@ -1381,12 +1436,25 @@ def _collect_all_dependencies_via_cli(cli_binary, project_root,
         if not out:
             return None
         data = json.loads(out)
+        # Shape validation (parity with the SDK side and the dsym
+        # helper). A future CLI shape change — accidental `"entry"`
+        # rename, list-instead-of-dict, non-string ids — must
+        # surface as "fall back to Python parsers" rather than
+        # crashing in `_build_dependencies_payload` further down
+        # the pipeline.
+        if not isinstance(data, dict):
+            return None
+        raw_entries = data.get("entries")
+        if not isinstance(raw_entries, list):
+            return None
+        entries = [e for e in raw_entries if isinstance(e, dict)
+                                            and isinstance(e.get("id"), str)]
         return (
-            data.get("entries") or [],
+            entries,
             data.get("scope_label") or "all",
             bool(data.get("truncated")),
         )
-    except (OSError, ValueError):
+    except _CLI_CATCHALL_EXCEPTIONS:
         return None
 
 
@@ -1743,8 +1811,7 @@ def _parse_dsym_via_cli(fullPath):
             return None
         # Each entry must be a UUID string.
         return [str(u) for u in data if isinstance(u, str)]
-    except (OSError, ValueError, TypeError,
-            subprocess.CalledProcessError):
+    except _CLI_CATCHALL_EXCEPTIONS:
         return None
 
 

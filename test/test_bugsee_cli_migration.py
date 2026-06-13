@@ -128,6 +128,10 @@ class TestResolveCli(unittest.TestCase):
         os.environ["HOME"] = self.fake_home
         os.environ.pop("BUGSEE_CLI_PATH", None)
         os.environ.pop("BUGSEE_CLI_VERSION", None)
+        # `resolveCli` caches its results for the lifetime of the
+        # process. Each test mutates env + fake home, so wipe the
+        # cache to keep tests independent of execution order.
+        agent._resolveCli_cache.clear()
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -196,6 +200,85 @@ class TestResolveCli(unittest.TestCase):
         self._make_executable(cache_bin)
         with patch.object(agent, "detectHostTriple", return_value=triple):
             self.assertEqual(agent.resolveCli(), cache_bin)
+
+    def test_resolves_cli_only_once_for_repeat_calls(self):
+        # Memoization pin. The fastlane plugin invokes resolveCli()
+        # from EVERY CLI helper (8+ times per build). Without
+        # memoization, each call walked the filesystem looking for a
+        # cached binary AND re-ran detectHostTriple. The cache should
+        # eliminate every call after the first under identical
+        # env+args.
+        bin_path = os.path.join(self.tmp, "cached-cli")
+        self._make_executable(bin_path)
+        os.environ["BUGSEE_CLI_PATH"] = bin_path
+        with patch.object(agent, "_resolveCli_uncached",
+                          return_value=bin_path) as inner_mock:
+            self.assertEqual(agent.resolveCli(), bin_path)
+            self.assertEqual(agent.resolveCli(), bin_path)
+            self.assertEqual(agent.resolveCli(), bin_path)
+        self.assertEqual(
+            inner_mock.call_count, 1,
+            "resolveCli must only invoke the uncached resolver once "
+            "for repeat calls with identical env + args",
+        )
+
+    def test_cache_keys_on_env_var_change(self):
+        # Defensive pin: if BUGSEE_CLI_PATH flips between resolveCli
+        # invocations (a malicious CI step swapping the binary,
+        # genuinely), the cache must not silently return the
+        # previously-resolved binary — the env-var changes are part
+        # of the cache key. (In practice the env is constant per
+        # build, but the cache must NOT trap state-poisoning.)
+        bin_a = os.path.join(self.tmp, "cli-a")
+        bin_b = os.path.join(self.tmp, "cli-b")
+        self._make_executable(bin_a)
+        self._make_executable(bin_b)
+        os.environ["BUGSEE_CLI_PATH"] = bin_a
+        self.assertEqual(agent.resolveCli(), bin_a)
+        os.environ["BUGSEE_CLI_PATH"] = bin_b
+        # Cache key includes the env var → flip should re-resolve.
+        self.assertEqual(agent.resolveCli(), bin_b)
+
+    def test_rejects_malformed_cli_version_traversal_attempt(self):
+        # Path-traversal pin. Pre-fix, a malicious BUGSEE_CLI_VERSION
+        # like `../../evil` would land the cached binary at
+        # `~/.bugsee/cli/../../evil/<triple>/bugsee-cli` — outside the
+        # intended cache root — AND get baked into the download URL.
+        # The strict X.Y.Z[-prerelease] regex now rejects it before
+        # either path uses the value, returning None as a soft
+        # failure.
+        os.environ["BUGSEE_CLI_VERSION"] = "../../evil"
+        triple = "aarch64-apple-darwin"
+        with patch.object(agent, "detectHostTriple", return_value=triple):
+            with patch.object(agent, "_downloadCli") as dl_mock:
+                self.assertIsNone(agent.resolveCli())
+                # Download must NOT be invoked — the rejection happens
+                # before any network / disk activity.
+                dl_mock.assert_not_called()
+
+    def test_rejects_malformed_cli_version_with_slash(self):
+        # Mirror pin for URL-injection-style abuse. A version like
+        # `1.0/../evil` would otherwise both create unintended cache
+        # subdirs AND inject path segments into the download URL.
+        with patch.object(agent, "detectHostTriple", return_value="aarch64-apple-darwin"), \
+             patch.object(agent, "_downloadCli") as dl_mock:
+            self.assertIsNone(agent.resolveCli(cliVersion="1.0/../evil"))
+            dl_mock.assert_not_called()
+
+    def test_accepts_canonical_semver_prerelease(self):
+        # Positive pin: well-formed prerelease versions DO pass the
+        # validator (e.g. "1.2.3-rc.1", "0.1.1-beta+sha.abc"). Ensures
+        # the regex isn't so strict it breaks legitimate releases.
+        triple = "aarch64-apple-darwin"
+        cache_bin = os.path.join(
+            self.fake_home, ".bugsee", "cli", "1.2.3-rc.1", triple, "bugsee-cli",
+        )
+        self._make_executable(cache_bin)
+        with patch.object(agent, "detectHostTriple", return_value=triple):
+            self.assertEqual(
+                agent.resolveCli(cliVersion="1.2.3-rc.1"),
+                cache_bin,
+            )
 
     def test_download_exception_returns_none_not_raise(self):
         # A network failure (or 404, SHA mismatch, etc.) inside
