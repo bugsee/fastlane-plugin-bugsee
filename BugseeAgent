@@ -480,7 +480,15 @@ def _parse_package_resolved(path):
             # tracking; `revision` for revision-locked pins. Prefer
             # the most specific human-readable value.
             version = state.get('version') or state.get('branch') or state.get('revision')
-        entries.append({
+        # SPM URL — `location` is the v2/v3 key, `repositoryURL`
+        # the v1 key. Load-bearing for OSV vuln lookups (OSV's
+        # SwiftURL ecosystem keys off this URL). The Rust CLI
+        # emits this field too (bugsee-cli/src/cli/ios_deps.rs's
+        # `parse_package_resolved`); the in-process Python
+        # fallback must match or the wire-shape silently diverges
+        # depending on which path produced the payload.
+        url = pin.get('location') or pin.get('repositoryURL')
+        entry = {
             "id":      _make_dep_id("library", "", name),
             "group":   "",
             "name":    name,
@@ -489,7 +497,10 @@ def _parse_package_resolved(path):
             "scope":   None,
             "type":    "library",
             "parents": [],
-        })
+        }
+        if url:
+            entry["url"] = url
+        entries.append(entry)
     return entries
 
 
@@ -615,41 +626,73 @@ def _parse_vendored_frameworks(binary_path):
 
 def _merge_dep_entries(*sources):
     """Combine multiple dep-entry lists into one. Deduplication
-    is by entry `id` — first-occurrence wins. Order across sources
-    is preserved (CocoaPods first since it's most likely to have
-    parent edges; then SPM; then Carthage; then vendored frames),
-    so the truncation cap (if it kicks in) drops the least-
-    informative entries first.
+    is field-wise — first-seen entry survives, but later sources
+    can graft on missing `url` / `version` / `parents` and OR-merge
+    the `direct` flag.
+
+    Why field-wise instead of pure first-source-wins: the parsers
+    populate these fields asymmetrically. CocoaPods walks the PODS
+    graph and emits `direct: false` + `parents: ["<umbrella>"]`
+    for transitive subspecs; SPM emits `direct: true` +
+    `parents: []` because `Package.resolved` only records resolved
+    pins, not the dependency graph; SPM ALSO carries the upstream
+    `url` (load-bearing for OSV vuln lookups). Wholesale-replacing
+    the existing record on url-preference would wipe the CocoaPods
+    graph evidence; ignoring url-bearing later sources would lose
+    the upstream URL. Mirrors the Rust CLI's `merge_dep_entries`
+    in `bugsee-cli/src/cli/ios_deps.rs`.
 
     Returns a `(entries, truncated)` pair, capped at
     [DEPENDENCIES_MAX_COUNT]. The truncated flag drives the
     summary's same-name field and ultimately the worker's
     compatibility check (truncated lists aren't diff-comparable).
     """
-    seen_ids = set()
-    out = []
-    truncated = False
+    by_id = {}
+    insertion_order = []
     for source in sources:
         for entry in source:
-            if entry["id"] in seen_ids:
+            eid = entry["id"]
+            if eid not in by_id:
+                # Defensive copy so later same-id mutations don't
+                # bleed back into the caller's source list.
+                by_id[eid] = dict(entry)
+                insertion_order.append(eid)
                 continue
-            if len(out) >= DEPENDENCIES_MAX_COUNT:
-                truncated = True
-                break
-            seen_ids.add(entry["id"])
-            out.append(entry)
-        if truncated:
-            break
+            prev = by_id[eid]
+            # url: copy from incoming when previous has none.
+            if not prev.get("url") and entry.get("url"):
+                prev["url"] = entry["url"]
+            # direct: OR-merge — any source reaching the package
+            # directly is authoritative.
+            if entry.get("direct"):
+                prev["direct"] = True
+            # version: fill in when previous has none.
+            if prev.get("version") in (None, "") and entry.get("version"):
+                prev["version"] = entry["version"]
+            # parents: backfill when previous is empty. The first
+            # non-empty parents list wins so a follow-on source
+            # with `parents: []` can't wipe the graph evidence.
+            if not prev.get("parents") and entry.get("parents"):
+                prev["parents"] = list(entry["parents"])
+
+    deduped = [by_id[i] for i in insertion_order]
+    truncated = False
+    if len(deduped) > DEPENDENCIES_MAX_COUNT:
+        truncated = True
+        # Direct-prefer truncation: keep direct entries first.
+        # Stable sort preserves insertion order within each group.
+        deduped.sort(key=lambda e: 0 if e.get("direct") else 1)
+        deduped = deduped[:DEPENDENCIES_MAX_COUNT]
 
     # Self-consistency pass: filter parents pointing at IDs that
     # didn't make it into the emitted set (truncation eviction
     # OR a malformed source listing a phantom parent). Same posture
     # as the Android plugin's post-truncation cleanup.
-    kept = {e["id"] for e in out}
-    for e in out:
-        if e["parents"]:
+    kept = {e["id"] for e in deduped}
+    for e in deduped:
+        if e.get("parents"):
             e["parents"] = [p for p in e["parents"] if p in kept]
-    return out, truncated
+    return deduped, truncated
 
 
 def _build_dependencies_payload(entries, truncated, scope_label,

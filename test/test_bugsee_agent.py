@@ -319,6 +319,70 @@ class TestParsePackageResolved(unittest.TestCase):
             os.unlink(path)
         self.assertEqual(entries[0]['version'], '5.8.1')
 
+    def test_extracts_url_from_v2_location_field(self):
+        # `location` is the v2/v3 SPM key; load-bearing for OSV
+        # SwiftURL vuln lookups. Pre-fix, the Python in-process
+        # fallback dropped this field — silently diverging from
+        # both the Rust CLI and the SDK-side Python parser.
+        body = json.dumps({
+            "pins": [{
+                "identity": "alamofire",
+                "kind": "remoteSourceControl",
+                "location": "https://github.com/Alamofire/Alamofire.git",
+                "state": {"version": "5.8.1"},
+            }],
+            "version": 2,
+        })
+        path = _write_fixture(body)
+        try:
+            entries = agent._parse_package_resolved(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(entries[0].get('url'),
+                         'https://github.com/Alamofire/Alamofire.git')
+
+    def test_extracts_url_from_v1_repositoryURL_field(self):
+        # Legacy v1 SPM key. Must also map to the same `url`
+        # output field so callers don't have to know about the
+        # version split.
+        body = json.dumps({
+            "object": {
+                "pins": [{
+                    "package": "Alamofire",
+                    "repositoryURL": "https://github.com/Alamofire/Alamofire.git",
+                    "state": {"version": "5.8.1"},
+                }],
+            },
+            "version": 1,
+        })
+        path = _write_fixture(body)
+        try:
+            entries = agent._parse_package_resolved(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(entries[0].get('url'),
+                         'https://github.com/Alamofire/Alamofire.git')
+
+    def test_omits_url_key_when_neither_location_nor_repositoryURL_present(self):
+        # Defensive: the field is optional in the wire shape (Rust
+        # CLI uses `skip_serializing_if=Option::is_none`). The
+        # Python side should likewise emit no `url` key rather
+        # than writing `None`, so downstream key-membership checks
+        # match the Rust output byte-for-byte.
+        body = json.dumps({
+            "pins": [{
+                "identity": "weird-pin",
+                "state": {"version": "1.0"},
+            }],
+            "version": 2,
+        })
+        path = _write_fixture(body)
+        try:
+            entries = agent._parse_package_resolved(path)
+        finally:
+            os.unlink(path)
+        self.assertNotIn('url', entries[0])
+
 
 # ──────────────────────────────────────────────
 # Cartfile.resolved parser
@@ -420,6 +484,82 @@ class TestMergeDepEntries(unittest.TestCase):
         # Dangling parent reference filtered out — the kept set
         # doesn't contain PARENT.
         self.assertEqual(merged[0]['parents'], [])
+
+    def test_url_preference_grafts_url_onto_first_seen_entry(self):
+        # The bite the field-wise merge closes. A CocoaPods entry
+        # (no url, has parents) comes first; an SPM entry (with
+        # url) comes second. Pre-fix the merger ignored later
+        # sources entirely and the upstream URL was lost — OSV
+        # vuln lookups silently lost coverage. Post-fix the SPM
+        # url is grafted onto the existing CocoaPods entry,
+        # preserving the parent edges.
+        umbrella = self._entry('Braintree')
+        cocoapods_child = self._entry('Braintree/Core',
+                                      parents=[umbrella['id']])
+        cocoapods_child['direct'] = False
+        spm_entry = self._entry('Braintree/Core')
+        spm_entry['url'] = 'https://github.com/braintree/braintree_ios.git'
+        merged, _ = agent._merge_dep_entries(
+            [umbrella, cocoapods_child],
+            [spm_entry],
+        )
+        core = next(e for e in merged if e['name'] == 'Braintree/Core')
+        self.assertEqual(
+            core.get('url'),
+            'https://github.com/braintree/braintree_ios.git',
+            'SPM url must graft onto the existing CocoaPods entry',
+        )
+        # Parents from CocoaPods survive — the load-bearing graph
+        # signal the dashboard's deps tree view relies on.
+        self.assertEqual(core['parents'], [umbrella['id']])
+        # direct is OR-merged. CocoaPods said False (transitive),
+        # SPM said True → result is True (it IS reachable
+        # directly via SPM).
+        self.assertTrue(core['direct'])
+
+    def test_url_preference_does_not_demote_existing_direct_true(self):
+        # Reverse asymmetry: SPM-style entry first (direct=true),
+        # then a CocoaPods transitive (direct=false) bringing
+        # parents. We pick up the parents but do NOT demote direct
+        # from true → false. (`direct: true` is monotonic.)
+        umbrella = self._entry('Umbrella')
+        spm_first = self._entry('Pkg')
+        spm_first['url'] = 'https://example.com/pkg.git'
+        cocoapods_child = self._entry('Pkg', parents=[umbrella['id']])
+        cocoapods_child['direct'] = False
+        merged, _ = agent._merge_dep_entries(
+            [spm_first],
+            [umbrella, cocoapods_child],
+        )
+        pkg = next(e for e in merged if e['name'] == 'Pkg')
+        self.assertTrue(pkg['direct'],
+                        'first-source direct=True must not be demoted')
+        # Empty previous parents → backfilled from incoming.
+        self.assertEqual(pkg['parents'], [umbrella['id']])
+
+    def test_url_preference_does_not_overwrite_existing_url(self):
+        # When BOTH colliding entries have a url, first-seen wins
+        # (no preference reason to replace).
+        a_first = self._entry('A')
+        a_first['url'] = 'https://first.example/A.git'
+        a_second = self._entry('A')
+        a_second['url'] = 'https://second.example/A.git'
+        merged, _ = agent._merge_dep_entries([a_first], [a_second])
+        self.assertEqual(merged[0]['url'], 'https://first.example/A.git')
+
+    def test_url_preference_fills_missing_version(self):
+        # Vendored frameworks emit `version: None`; SPM provides a
+        # version. Field-wise merge should backfill the version
+        # without affecting the existing url-less entry's other
+        # fields.
+        vendored = self._entry('Foo')
+        vendored['version'] = None
+        spm = self._entry('Foo')
+        spm['version'] = '2.0'
+        spm['url'] = 'https://example.com/foo.git'
+        merged, _ = agent._merge_dep_entries([vendored], [spm])
+        self.assertEqual(merged[0]['version'], '2.0')
+        self.assertEqual(merged[0]['url'], 'https://example.com/foo.git')
 
 
 # ──────────────────────────────────────────────
