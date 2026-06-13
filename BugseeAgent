@@ -1817,8 +1817,20 @@ def getVersionAndBuild(zipFile):
     else:
         try:
             info_file_path = os.path.join(options.build_dir, os.environ['INFOPLIST_PATH'])
-            cmd = '/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" -c "Print :CFBundleVersion" "' + info_file_path + '"'
-            p = subprocess.Popen([cmd], stdout=subprocess.PIPE, shell=True)
+            # Argv list — never shell=True. The PlistBuddy invocation
+            # used to be `subprocess.Popen([cmd], shell=True)` with the
+            # info_file_path concatenated into the command string,
+            # which broke quoting on any project path containing a
+            # quote/apostrophe AND opened a shell-injection sink if
+            # INFOPLIST_PATH or build_dir came from an attacker-
+            # controlled env var. The list form bypasses the shell
+            # entirely; quoting is no longer the script's problem.
+            p = subprocess.Popen([
+                '/usr/libexec/PlistBuddy',
+                '-c', 'Print :CFBundleShortVersionString',
+                '-c', 'Print :CFBundleVersion',
+                info_file_path,
+            ], stdout=subprocess.PIPE)
             stdout, stderr = p.communicate()
             version, build = stdout.decode().split()
         except Exception as error:
@@ -1841,16 +1853,21 @@ def requestEndPoint(version, build):
     return json.loads(text.decode())
 
 def uploadBundle(endpoint, filePath):
-    # TODO: Change it to urllib2 as well
-    cmd = 'curl -v -T "' + filePath + '" "' + endpoint + '"' + ' --write-out %{http_code} --silent --output /dev/null'
-    p = subprocess.Popen([cmd], 
-                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
-    stdout, stderr = p.communicate()
-    code = stdout.decode()
-    if code == '200':
-        return True
-
-    return False
+    # PUT the file via urllib instead of shelling to curl. The
+    # original `curl -v -T "<filePath>" "<endpoint>"` was constructed
+    # by string concatenation and passed to `subprocess.Popen([cmd],
+    # shell=True)` — broken on any filePath/endpoint containing
+    # quotes and a shell-injection sink for the server-returned
+    # endpoint URL. urllib was already imported for adjacent
+    # uploadStatus/requestEndPoint calls; reuse it.
+    try:
+        with open(filePath, 'rb') as f:
+            data = f.read()
+        req = urllib.request.Request(endpoint, data=data, method='PUT')
+        with urllib.request.urlopen(req) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
 
 def updateStatus(symbolId):
     encoded_data = json.dumps({
