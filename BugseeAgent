@@ -1306,16 +1306,26 @@ def _read_info_plist(plist_path):
 
     Prefers `bugsee-cli build-env read-plist` when available
     (single cross-language source of truth). Falls back to the
-    in-process `plistlib.load` below."""
+    in-process `plistlib.load` below.
+
+    Choke-point dict-coercion: every caller (`_collect_build_metadata`,
+    `resolve_bundle_info_from_app`, `_extract_uuid_from_app`, …)
+    indexes the return value as a dict. The CLI's `read-plist`
+    returns whatever `json.loads(stdout)` produces with no shape
+    validation, so a future CLI bug, version-skew, or exotic plist
+    could surface as a list/string/number and crash every call site
+    with `AttributeError`. Coerce non-dict returns to `{}` HERE so
+    no caller needs its own isinstance guard."""
     via_cli = _read_info_plist_via_cli(plist_path)
     if via_cli is not None:
-        return via_cli
+        return via_cli if isinstance(via_cli, dict) else {}
 
     if not plist_path or not os.path.isfile(plist_path):
         return {}
     try:
         with open(plist_path, 'rb') as f:
-            return plistlib.load(f)
+            data = plistlib.load(f)
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
@@ -1336,14 +1346,70 @@ def resolve_bundle_info_from_app(app_path):
     if not app_path or not os.path.isdir(app_path):
         return (None, None, None)
     plist_path = os.path.join(app_path, 'Info.plist')
+    # `_read_info_plist` coerces non-dict CLI returns to `{}` at the
+    # choke point, so an unguarded `.get()` is safe here.
     info = _read_info_plist(plist_path)
-    if not isinstance(info, dict):
-        return (None, None, None)
     return (
         info.get('CFBundleIdentifier'),
         info.get('CFBundleShortVersionString'),
         info.get('CFBundleVersion'),
     )
+
+
+# Arch preference order for fat-binary LC_UUID selection. arm64 wins
+# because it's the slice the runtime SDK reports on actual device
+# crashes; arm64e is M-series Macs; x86_64 covers Intel macs; the
+# simulator variants come last (only useful for simulator-only Debug
+# Build configs). Matches the SDK BugseeAgent's
+# `tools.bundle/BugseeAgent::_PREFERRED_MACHO_ARCHS` ordering exactly
+# so the fastlane and SDK producers emit the SAME uuid for the same
+# fat-binary build.
+_PREFERRED_MACHO_ARCHS = ('arm64', 'arm64e', 'x86_64',
+                         'arm64-simulator', 'x86_64-simulator')
+
+
+def _load_macho_slices_via_cli(binary_path):
+    """Shell to `bugsee-cli dsym slices <binary>` and return a
+    `{arch: uuid}` dict, or None when the CLI is unavailable / its
+    output can't be parsed.
+
+    Mirrors the SDK BugseeAgent's `_load_macho_slices_via_cli` so
+    `_extract_uuid_from_app` can pick the preferred arch's UUID on
+    fat binaries — same posture as the SDK side, which means the two
+    producers emit byte-identical uuids for the same artefact."""
+    if not binary_path:
+        return None
+    cli = shutil.which("bugsee-cli")
+    if not cli:
+        return None
+    try:
+        result = subprocess.run(
+            [cli, "dsym", "slices", binary_path],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if result.returncode != 0:
+            return None
+        out = (result.stdout or "").strip()
+        if not out:
+            return None
+        data = json.loads(out)
+        if not isinstance(data, list):
+            return None
+    except _CLI_CATCHALL_EXCEPTIONS:
+        return None
+    slices = {}
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        uuid_str = entry.get('uuid')
+        arch = entry.get('arch')
+        if not isinstance(uuid_str, str) or not isinstance(arch, str):
+            continue
+        # First-seen wins for duplicate arch entries — matches the
+        # SDK side's behaviour (rare exotic case).
+        if arch not in slices:
+            slices[arch] = uuid_str
+    return slices
 
 
 def _extract_uuid_from_app(app_path):
@@ -1367,20 +1433,55 @@ def _extract_uuid_from_app(app_path):
     if not app_path or not os.path.isdir(app_path):
         return None
     plist_path = os.path.join(app_path, 'Info.plist')
+    # `_read_info_plist` returns `{}` for non-dict CLI output, so
+    # `.get()` is safe without an isinstance guard.
     info = _read_info_plist(plist_path)
-    executable_name = info.get('CFBundleExecutable') if isinstance(info, dict) else None
+    executable_name = info.get('CFBundleExecutable')
     if not executable_name:
         return None
     binary_path = os.path.join(app_path, executable_name)
     if not os.path.isfile(binary_path):
         return None
-    uuids = _parse_dsym_via_cli(binary_path)
-    if not uuids:
+    # Prefer the arch-aware `dsym slices` subcommand so a fat binary's
+    # arm64 slice (the one the iOS runtime SDK reports at crash time)
+    # wins over x86_64/simulator slices that may appear first in the
+    # archive's load-command order. Mirrors the SDK BugseeAgent's
+    # `get_main_executable_uuid` posture exactly — without this, the
+    # fastlane producer path and the SDK producer path could emit
+    # different uuids for the same fat-binary build.
+    slices = _load_macho_slices_via_cli(binary_path)
+    candidate_uuid = None
+    if slices:
+        for arch in _PREFERRED_MACHO_ARCHS:
+            if arch in slices:
+                candidate_uuid = slices[arch]
+                break
+        if candidate_uuid is None:
+            # Exotic arch — take the first reported. Deterministic
+            # because the dict preserved insertion order from the CLI
+            # output (Python 3.7+).
+            candidate_uuid = next(iter(slices.values()))
+
+    # Fallback to the flat `dsym uuid` subcommand (for older bugsee-cli
+    # versions or when slices returned None — e.g. CLI not on PATH and
+    # the helper short-circuited).
+    if candidate_uuid is None:
+        uuids = _parse_dsym_via_cli(binary_path)
+        if uuids:
+            candidate_uuid = uuids[0]
+
+    if not candidate_uuid:
         return None
-    # First slice's UUID, normalised to lowercase hex without
-    # dashes — matches the iOS runtime's
-    # `[NSString stringWithFormat:@"%02X..."] lowercaseString` shape.
-    return uuids[0].replace('-', '').lower()
+    # Normalise to lowercase hex without dashes — matches the iOS
+    # runtime's `[NSString stringWithFormat:@"%02X..."] lowercaseString`
+    # shape (`BGSCrashReport.m`). Strip whitespace and reject empty
+    # results so a hypothetical CLI bug emitting `"  "` or `"-"`
+    # doesn't propagate a meaningless build UUID into the
+    # registration payload.
+    candidate = candidate_uuid.replace('-', '').strip().lower()
+    if not candidate:
+        return None
+    return candidate
 
 
 def _collect_build_metadata():
@@ -2008,14 +2109,26 @@ def run_artifact_upload_flow(app_token, endpoint, app_path,
         #   3. uuid.uuid4() — pure random fallback. The build record
         #      is still useful for the size-trend chart but crash-
         #      to-build join is best-effort in this case.
+        # All three cascade steps must emit a SINGLE canonical UUID
+        # format — lowercase hex, no dashes — matching what the iOS
+        # runtime SDK reports (`BGSCrashReport.m`'s `LC_UUID` shape).
+        # Step 1 (`_extract_uuid_from_app`) already returns that
+        # shape. Step 2 (`_extract_first_dwarf_uuid`) returns
+        # UPPERCASE HYPHENATED (`54D75FB3-747F-...`) and step 3
+        # (`uuid.uuid4()`) returns lowercase hyphenated. Without
+        # normalisation the same project would emit 3 DIFFERENT uuid
+        # shapes depending on which fallback hit, and the back-end's
+        # crash-join key would only match on step-1.
         build_uuid = _extract_uuid_from_app(app_path)
         if not build_uuid:
             try:
-                build_uuid = _extract_first_dwarf_uuid()
+                dwarf = _extract_first_dwarf_uuid()
             except NameError:
-                build_uuid = None
+                dwarf = None
+            if dwarf:
+                build_uuid = dwarf.replace('-', '').strip().lower() or None
         if not build_uuid:
-            build_uuid = str(uuid.uuid4())
+            build_uuid = str(uuid.uuid4()).replace('-', '').lower()
         payload['uuid'] = build_uuid
 
         # VCS metadata (best-effort). Resolves via bugsee-cli when on

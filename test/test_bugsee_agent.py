@@ -1915,6 +1915,38 @@ class TestResolveVcsMetadata(unittest.TestCase):
         self.assertNotIn('pr_number', vcs)
         self.assertNotIn('base_branch', vcs)
 
+    def test_gitlab_tag_pipeline_omits_branch(self):
+        # Tag pipelines set CI_COMMIT_TAG (not CI_COMMIT_BRANCH) +
+        # CI_COMMIT_REF_NAME (the tag name). The historic fallback
+        # leaked the tag into the branch column. Post-fix: branch
+        # must be absent on tag pipelines.
+        with mock.patch.dict(os.environ, {
+            'GITLAB_CI':          'true',
+            'CI_COMMIT_SHA':      'gl-tag-sha',
+            'CI_COMMIT_TAG':      'v1.0.0',
+            'CI_COMMIT_REF_NAME': 'v1.0.0',
+        }, clear=True):
+            vcs = agent.resolve_vcs_metadata('/no/working/dir')
+        self.assertEqual(vcs['provider'], 'gitlab')
+        self.assertNotIn(
+            'branch', vcs,
+            "tag pipeline must omit `branch`, not echo the tag name",
+        )
+
+    def test_gitlab_branch_pipeline_prefers_ci_commit_branch(self):
+        # Modern GitLab (>=12.6) sets both CI_COMMIT_BRANCH and
+        # CI_COMMIT_REF_NAME on branch pipelines. The gate must
+        # prefer CI_COMMIT_BRANCH (only set on branch pipelines)
+        # over the more-ambiguous ref-name fallback.
+        with mock.patch.dict(os.environ, {
+            'GITLAB_CI':          'true',
+            'CI_COMMIT_SHA':      'gl-branch-sha',
+            'CI_COMMIT_BRANCH':   'feature/x',
+            'CI_COMMIT_REF_NAME': 'feature/x',
+        }, clear=True):
+            vcs = agent.resolve_vcs_metadata('/no/working/dir')
+        self.assertEqual(vcs['branch'], 'feature/x')
+
     def test_bitbucket_pr(self):
         with mock.patch.dict(os.environ, {
             'BITBUCKET_BUILD_NUMBER':       '42',
