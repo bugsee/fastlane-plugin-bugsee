@@ -1092,7 +1092,12 @@ class TestReadInfoPlist(unittest.TestCase):
         # `.get(...)` and would crash with AttributeError if the
         # coercion didn't fire at the choke point. Pin: non-dict
         # CLI returns flatten to {} so callers are uniformly safe.
-        for non_dict in [[1, 2, 3], "string", 42, None]:
+        #
+        # NOTE: None is NOT in this iteration — `_read_info_plist_via_cli`
+        # returning None means "CLI couldn't run; fall through to
+        # plistlib", which exercises a different branch.
+        # `test_cli_none_falls_through_to_plistlib` covers that.
+        for non_dict in [[1, 2, 3], "string", 42]:
             with mock.patch.object(
                 agent, '_read_info_plist_via_cli',
                 return_value=non_dict,
@@ -1102,6 +1107,28 @@ class TestReadInfoPlist(unittest.TestCase):
                 result, {},
                 "non-dict CLI return %r must coerce to {}" % (non_dict,),
             )
+
+    def test_cli_none_falls_through_to_plistlib(self):
+        # When `_read_info_plist_via_cli` returns None (CLI not on
+        # PATH / non-zero exit), control flows to the plistlib
+        # branch. Distinct path from the dict-coerce one — must be
+        # tested separately, otherwise a mutation that flipped the
+        # CLI/plistlib branching would slip through.
+        import plistlib
+        fd, path = tempfile.mkstemp(suffix='.plist')
+        with os.fdopen(fd, 'wb') as f:
+            plistlib.dump({'PlistlibBranchRan': 'yes'}, f)
+        try:
+            with mock.patch.object(
+                agent, '_read_info_plist_via_cli', return_value=None,
+            ):
+                result = agent._read_info_plist(path)
+        finally:
+            os.unlink(path)
+        # Specifically the plistlib branch's value — proves we
+        # didn't accidentally short-circuit through a different
+        # branch that returned `{}`.
+        self.assertEqual(result.get('PlistlibBranchRan'), 'yes')
 
     def test_coerces_non_dict_plistlib_return_to_empty_dict(self):
         # plistlib can parse top-level NSArray plists into a list
@@ -1237,6 +1264,97 @@ class TestExtractUuidFromApp(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestLoadMachoSlicesViaCli(unittest.TestCase):
+    """Pin the helper itself — `TestExtractUuidFromApp` mocks the
+    helper out, so a bug in `_load_macho_slices_via_cli` itself
+    would slip past every arch-cascade test. These cases exercise
+    the helper directly against a canned `bugsee-cli dsym slices`
+    stdout fixture so the JSON parsing + shape validation contract
+    has its own regression target."""
+
+    def _stub_run(self, returncode=0, stdout=''):
+        from types import SimpleNamespace
+        return SimpleNamespace(returncode=returncode, stdout=stdout)
+
+    def test_parses_canned_dsym_slices_stdout(self):
+        # Exact JSON shape the CLI emits: a list of `{uuid, arch}`
+        # objects. Pin: the helper builds an arch→uuid dict.
+        canned = (
+            '[{"uuid":"AA00000000000000000000000000000033","arch":"arm64"},'
+            ' {"uuid":"BB00000000000000000000000000000011","arch":"x86_64"}]'
+        )
+        with mock.patch.object(agent.shutil, 'which',
+                               return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout=canned)):
+            slices = agent._load_macho_slices_via_cli('/some/binary')
+        self.assertEqual(slices, {
+            'arm64':  'AA00000000000000000000000000000033',
+            'x86_64': 'BB00000000000000000000000000000011',
+        })
+
+    def test_returns_none_when_cli_not_on_path(self):
+        with mock.patch.object(agent.shutil, 'which',
+                               return_value=None):
+            self.assertIsNone(
+                agent._load_macho_slices_via_cli('/some/binary'),
+            )
+
+    def test_returns_none_on_non_zero_exit(self):
+        with mock.patch.object(agent.shutil, 'which',
+                               return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=2, stdout='[]')):
+            self.assertIsNone(
+                agent._load_macho_slices_via_cli('/some/binary'),
+            )
+
+    def test_returns_none_on_malformed_json(self):
+        with mock.patch.object(agent.shutil, 'which',
+                               return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout='not json {{{')):
+            self.assertIsNone(
+                agent._load_macho_slices_via_cli('/some/binary'),
+            )
+
+    def test_returns_none_on_non_list_top_level(self):
+        # A future CLI bug emitting `{"slices": [...]}` would silently
+        # become "no slices" instead of crashing.
+        with mock.patch.object(agent.shutil, 'which',
+                               return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0,
+                                      stdout='{"wrong":"shape"}')):
+            self.assertIsNone(
+                agent._load_macho_slices_via_cli('/some/binary'),
+            )
+
+    def test_skips_malformed_slice_entries(self):
+        # Defensive: non-dict / missing uuid / missing arch entries
+        # are skipped rather than crashing the whole call.
+        canned = (
+            '[{"uuid":"AA00000000000000000000000000000033","arch":"arm64"},'
+            ' "not-a-dict",'
+            ' {"uuid":"BB00"},'                   # missing arch
+            ' {"arch":"x86_64"},'                 # missing uuid
+            ' {"uuid":42,"arch":"arm64e"}]'       # non-string uuid
+        )
+        with mock.patch.object(agent.shutil, 'which',
+                               return_value='/cli'), \
+                mock.patch.object(agent.subprocess, 'run',
+                                  return_value=self._stub_run(
+                                      returncode=0, stdout=canned)):
+            slices = agent._load_macho_slices_via_cli('/some/binary')
+        self.assertEqual(slices, {
+            'arm64': 'AA00000000000000000000000000000033',
+        })
+
+
 class TestNormaliseBuildUuid(unittest.TestCase):
     """Pin the canonical 32-char lowercase-no-dash shape every cascade
     exit funnels through. Catches a regression in any of the three
@@ -1274,24 +1392,37 @@ class TestNormaliseBuildUuid(unittest.TestCase):
             )
 
     def test_emitted_shape_is_32_lowercase_hex(self):
-        # Output contract: exactly 32 characters, all in
-        # `[0-9a-f]`. Catches a mutation that switched to uppercase
-        # or kept dashes.
-        import re
-        for raw in [
+        # Output contract: exactly 32 characters, lowercase, no
+        # dashes. Catches a mutation that switched to uppercase or
+        # kept dashes. The previous version short-circuited on
+        # `out is None` and a mutation that returned None for every
+        # valid input would have escaped — explicit `assertIsNotNone`
+        # closes that loophole.
+        valid_inputs = [
             '54D75FB3-747F-387F-8A93-4EA034B1F8CF',
             'aaaa1111-bbbb-2222-cccc-333344445555',
-            'ZZ' * 16,  # technically not hex but shape pin
-        ]:
+            'ZZ' * 16,  # not hex but shape contract still applies
+        ]
+        for raw in valid_inputs:
             out = agent._normalise_build_uuid(raw)
-            if out is None:
-                continue
+            self.assertIsNotNone(
+                out,
+                "expected non-None for valid-shape input %r" % raw,
+            )
             self.assertEqual(len(out), 32, "len(%r) != 32" % out)
             self.assertEqual(
                 out, out.lower(),
                 "%r contains uppercase chars" % out,
             )
             self.assertNotIn('-', out, "%r still contains dashes" % out)
+        # Specific output pin for the non-hex case so a mutation that
+        # silently filtered non-hex chars would surface.
+        self.assertEqual(
+            agent._normalise_build_uuid('ZZ' * 16),
+            'zz' * 16,
+            "non-hex passthrough must survive — only case/dashes are "
+            "normalised, not character validity",
+        )
 
 
 class TestFindFirstAbove(unittest.TestCase):

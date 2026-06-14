@@ -1475,18 +1475,12 @@ def _extract_uuid_from_app(app_path):
         if uuids:
             candidate_uuid = uuids[0]
 
-    if not candidate_uuid:
-        return None
-    # Normalise to lowercase hex without dashes — matches the iOS
-    # runtime's `[NSString stringWithFormat:@"%02X..."] lowercaseString`
-    # shape (`BGSCrashReport.m`). Strip whitespace and reject empty
-    # results so a hypothetical CLI bug emitting `"  "` or `"-"`
-    # doesn't propagate a meaningless build UUID into the
-    # registration payload.
-    candidate = candidate_uuid.replace('-', '').strip().lower()
-    if not candidate:
-        return None
-    return candidate
+    # Funnel through the shared choke-point helper so the canonical
+    # shape contract (32 lowercase hex chars, no dashes, whitespace-
+    # only → None) lives in one place. Makes a regression that flipped
+    # the normalisation rule trivially visible — every caller flows
+    # through `_normalise_build_uuid`.
+    return _normalise_build_uuid(candidate_uuid)
 
 
 def _collect_build_metadata():
