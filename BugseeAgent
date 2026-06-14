@@ -1418,14 +1418,19 @@ def _extract_uuid_from_app(app_path):
     lowercase hex chars, no dashes. Returns None on any failure
     (missing CFBundleExecutable, binary absent, CLI missing).
 
-    Shells to `bugsee-cli dsym uuid <main_binary>` and picks the
-    FIRST returned UUID. The CLI's `dsym slices` subcommand returns
-    arch-aware tuples; we use the simpler `dsym uuid` here because
-    most fastlane archive flows are single-arch arm64 device builds
-    (the only arch that matters for crash-to-build join). The
-    SDK side has its own `get_main_executable_uuid` with a full
-    arch-preference cascade — call that out as a follow-up if
-    fastlane-uploaded multi-arch builds ever materialise.
+    Prefers the arch-aware `bugsee-cli dsym slices <main_binary>`
+    subcommand and picks the preferred-arch UUID via the cascade
+    `arm64 → arm64e → x86_64 → arm64-simulator → x86_64-simulator →
+    first reported`. Falls back to the flat `dsym uuid` subcommand
+    only when slices returns None (older bugsee-cli versions that
+    predate the slices subcommand, or when the CLI isn't on PATH).
+
+    Mirrors the SDK BugseeAgent's `get_main_executable_uuid` posture
+    exactly so the fastlane producer path and the SDK producer path
+    emit the SAME uuid for the same fat-binary build — without this
+    cross-source consistency the back-end's `crash.uuid → build`
+    join would only match on whichever producer happened to upload
+    the build record.
 
     The format matches `BGSCrashReport.m`'s LC_UUID reporting so
     the back-end can join `crash.uuid → build.uuid` deterministically.
@@ -1661,12 +1666,37 @@ def package_app_as_ipa(app_path, output_ipa_path):
     return output_ipa_path
 
 
+def _normalise_build_uuid(raw):
+    """Coerce a Mach-O LC_UUID string to the canonical wire format
+    the back-end uses for `crash.uuid → build.uuid` join: 32
+    lowercase hex chars, no dashes, no whitespace. Matches the iOS
+    runtime SDK's `BGSCrashReport.m` shape verbatim. Returns None on
+    empty/whitespace-only input so callers never write a meaningless
+    uuid into the registration payload.
+
+    Used at every uuid-cascade exit point — `_extract_uuid_from_app`
+    (Mach-O), `_extract_first_dwarf_uuid` (dSYM scan via dwarfdump),
+    and the random-fallback in run_artifact_upload_flow (uuid4) —
+    so all three steps produce a single canonical shape regardless
+    of which fallback hit."""
+    if not raw:
+        return None
+    candidate = str(raw).replace('-', '').strip().lower()
+    return candidate or None
+
+
 def _extract_first_dwarf_uuid():
     """Scan the dSYM folder for the FIRST Mach-O UUID we can find
     via dwarfdump. The Android plugin sends a single per-build
     UUID; we mirror that posture by surfacing the main binary's
     first arch slice UUID (typically arm64). Returns None on any
-    error or if no dSYMs are present."""
+    error or if no dSYMs are present.
+
+    Returns the value already normalised through
+    `_normalise_build_uuid` so callers don't need to know whether
+    `parseDSYM`'s underlying tool (bugsee-cli OR dwarfdump fallback)
+    emitted uppercase-hyphenated, lowercase-hyphenated, or
+    lowercase-no-dashes — they all converge here."""
     folder = options.dsym_folder
     if not folder or not os.path.isdir(folder):
         return None
@@ -1679,7 +1709,7 @@ def _extract_first_dwarf_uuid():
                 continue
             uuids = parseDSYM(full)
             if uuids:
-                return uuids[0]
+                return _normalise_build_uuid(uuids[0])
     return None
 
 
@@ -2109,26 +2139,21 @@ def run_artifact_upload_flow(app_token, endpoint, app_path,
         #   3. uuid.uuid4() — pure random fallback. The build record
         #      is still useful for the size-trend chart but crash-
         #      to-build join is best-effort in this case.
-        # All three cascade steps must emit a SINGLE canonical UUID
-        # format — lowercase hex, no dashes — matching what the iOS
-        # runtime SDK reports (`BGSCrashReport.m`'s `LC_UUID` shape).
-        # Step 1 (`_extract_uuid_from_app`) already returns that
-        # shape. Step 2 (`_extract_first_dwarf_uuid`) returns
-        # UPPERCASE HYPHENATED (`54D75FB3-747F-...`) and step 3
-        # (`uuid.uuid4()`) returns lowercase hyphenated. Without
-        # normalisation the same project would emit 3 DIFFERENT uuid
-        # shapes depending on which fallback hit, and the back-end's
-        # crash-join key would only match on step-1.
+        # All cascade exits funnel through `_normalise_build_uuid`
+        # so the registration payload's `uuid` is always the canonical
+        # 32-char lowercase-no-dash shape the back-end joins on.
+        # `_extract_uuid_from_app` and `_extract_first_dwarf_uuid`
+        # both already normalise on their way out (#2/#4/#11 fix);
+        # the random fallback also goes through the helper for the
+        # same reason.
         build_uuid = _extract_uuid_from_app(app_path)
         if not build_uuid:
             try:
-                dwarf = _extract_first_dwarf_uuid()
+                build_uuid = _extract_first_dwarf_uuid()
             except NameError:
-                dwarf = None
-            if dwarf:
-                build_uuid = dwarf.replace('-', '').strip().lower() or None
+                build_uuid = None
         if not build_uuid:
-            build_uuid = str(uuid.uuid4()).replace('-', '').lower()
+            build_uuid = _normalise_build_uuid(str(uuid.uuid4()))
         payload['uuid'] = build_uuid
 
         # VCS metadata (best-effort). Resolves via bugsee-cli when on
@@ -2232,8 +2257,13 @@ def _run_dependencies_pipeline(app_token, project_root):
     # Guard against writing `"uuid": null` into the POST body when the
     # dSYM scan yields nothing (e.g. a lane that ships build-info-only
     # with no dSYMs alongside). The historic assignment unconditionally
-    # set the value, leaking the None into the JSON. Mirrors the
-    # artifact-upload-flow pattern in this same file.
+    # set the value, leaking the None into the JSON.
+    #
+    # `_extract_first_dwarf_uuid` now normalises through
+    # `_normalise_build_uuid` on its way out (lifted from the per-
+    # callsite normalisation that used to live only in
+    # run_artifact_upload_flow), so `dwarf_uuid` here is already the
+    # canonical 32-char lowercase-no-dash shape the back-end joins on.
     dwarf_uuid = _extract_first_dwarf_uuid()
     if dwarf_uuid:
         body["uuid"] = dwarf_uuid

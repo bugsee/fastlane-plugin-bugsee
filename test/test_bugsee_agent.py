@@ -1084,10 +1084,215 @@ class TestReadInfoPlist(unittest.TestCase):
             os.unlink(path)
         self.assertEqual(result, {})
 
+    def test_coerces_non_dict_cli_return_to_empty_dict(self):
+        # The CLI's `build-env read-plist` returns whatever
+        # `json.loads(stdout)` produces with no shape validation.
+        # A future CLI bug or version skew could surface as a JSON
+        # array / string / number — every caller indexes with
+        # `.get(...)` and would crash with AttributeError if the
+        # coercion didn't fire at the choke point. Pin: non-dict
+        # CLI returns flatten to {} so callers are uniformly safe.
+        for non_dict in [[1, 2, 3], "string", 42, None]:
+            with mock.patch.object(
+                agent, '_read_info_plist_via_cli',
+                return_value=non_dict,
+            ):
+                result = agent._read_info_plist('/some/path.plist')
+            self.assertEqual(
+                result, {},
+                "non-dict CLI return %r must coerce to {}" % (non_dict,),
+            )
+
+    def test_coerces_non_dict_plistlib_return_to_empty_dict(self):
+        # plistlib can parse top-level NSArray plists into a list
+        # (rare but legal). Same coercion as the CLI path — the
+        # callers want a dict-or-{} interface.
+        import plistlib
+        fd, path = tempfile.mkstemp(suffix='.plist')
+        with os.fdopen(fd, 'wb') as f:
+            plistlib.dump(['arr', 'top', 'level'], f)
+        try:
+            # Force the plistlib branch (CLI returns None).
+            with mock.patch.object(
+                agent, '_read_info_plist_via_cli', return_value=None,
+            ):
+                result = agent._read_info_plist(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(result, {})
+
 
 # ──────────────────────────────────────────────
 # _find_first_above
 # ──────────────────────────────────────────────
+
+class TestExtractUuidFromApp(unittest.TestCase):
+    """Pin the arch-cascade + format normalisation contract for
+    `_extract_uuid_from_app`. Mirrors the SDK BugseeAgent's
+    `test_bugsee_agent_dsym_cli.py::TestGetMainExecutableUuid` posture
+    so both producers stay byte-identical for the same fat-binary
+    build."""
+
+    def _make_app(self, executable_name='Foo'):
+        tmp = tempfile.mkdtemp()
+        app = os.path.join(tmp, 'Foo.app')
+        os.makedirs(app)
+        import plistlib
+        with open(os.path.join(app, 'Info.plist'), 'wb') as f:
+            plistlib.dump({'CFBundleExecutable': executable_name}, f)
+        with open(os.path.join(app, executable_name), 'wb') as f:
+            f.write(b'macho-stub')
+        return tmp, app
+
+    def test_picks_arm64_slice_from_fat_binary(self):
+        # Three slices: arm64, x86_64, arm64-simulator. arm64 wins
+        # per _PREFERRED_MACHO_ARCHS cascade.
+        tmp, app = self._make_app()
+        try:
+            slices = {
+                'x86_64':           'BB00000000000000000000000000000011',
+                'arm64-simulator':  'CC00000000000000000000000000000022',
+                'arm64':            'AA00000000000000000000000000000033',
+            }
+            with mock.patch.object(
+                agent, '_load_macho_slices_via_cli',
+                return_value=slices,
+            ):
+                uuid_str = agent._extract_uuid_from_app(app)
+            # Lowercase no-dashes — normalised at the cascade exit.
+            self.assertEqual(
+                uuid_str, 'aa00000000000000000000000000000033',
+                "arm64 slice must win over x86_64 / simulator",
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_falls_back_to_first_slice_when_no_preferred_arch(self):
+        # Only an exotic arch present (e.g. riscv64 — not in the
+        # _PREFERRED_MACHO_ARCHS list). Should pick the first
+        # reported by the CLI (dict-insertion-order in Python 3.7+).
+        tmp, app = self._make_app()
+        try:
+            slices = {
+                'riscv64': 'DD00000000000000000000000000000044',
+            }
+            with mock.patch.object(
+                agent, '_load_macho_slices_via_cli',
+                return_value=slices,
+            ):
+                uuid_str = agent._extract_uuid_from_app(app)
+            self.assertEqual(uuid_str, 'dd00000000000000000000000000000044')
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_falls_back_to_flat_dsym_uuid_when_slices_returns_none(self):
+        # Older bugsee-cli without the `dsym slices` subcommand.
+        # Slices helper returns None; flat-uuid helper supplies the
+        # first UUID; we normalise it.
+        tmp, app = self._make_app()
+        try:
+            with mock.patch.object(
+                agent, '_load_macho_slices_via_cli',
+                return_value=None,
+            ), mock.patch.object(
+                agent, '_parse_dsym_via_cli',
+                return_value=['EE000000-0000-0000-0000-000000000055'],
+            ):
+                uuid_str = agent._extract_uuid_from_app(app)
+            # Lowercase, no dashes, exactly 32 chars — the normalised
+            # canonical shape.
+            self.assertEqual(uuid_str, 'ee000000000000000000000000000055')
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_returns_none_when_executable_missing_from_plist(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            app = os.path.join(tmp, 'Foo.app')
+            os.makedirs(app)
+            import plistlib
+            with open(os.path.join(app, 'Info.plist'), 'wb') as f:
+                plistlib.dump({'CFBundleIdentifier': 'com.example'}, f)
+            # No CFBundleExecutable → None.
+            self.assertIsNone(agent._extract_uuid_from_app(app))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_normalisation_strips_whitespace_and_rejects_empty(self):
+        # The whitespace-only guard. Defensive against a future CLI
+        # bug emitting `"  "` or `"-"` for an unparseable Mach-O.
+        tmp, app = self._make_app()
+        try:
+            for raw in ["  ", "-", "---", ""]:
+                with mock.patch.object(
+                    agent, '_load_macho_slices_via_cli',
+                    return_value={'arm64': raw},
+                ):
+                    self.assertIsNone(
+                        agent._extract_uuid_from_app(app),
+                        "whitespace-only / dashes-only %r must produce None"
+                        % (raw,),
+                    )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestNormaliseBuildUuid(unittest.TestCase):
+    """Pin the canonical 32-char lowercase-no-dash shape every cascade
+    exit funnels through. Catches a regression in any of the three
+    cascade fallbacks (Mach-O LC_UUID, dwarfdump dSYM scan,
+    uuid.uuid4)."""
+
+    def test_uppercase_hyphenated_input_normalises(self):
+        # The shape `dwarfdump -u` historically emits.
+        self.assertEqual(
+            agent._normalise_build_uuid('54D75FB3-747F-387F-8A93-4EA034B1F8CF'),
+            '54d75fb3747f387f8a934ea034b1f8cf',
+        )
+
+    def test_lowercase_hyphenated_input_normalises(self):
+        # The shape `uuid.uuid4()` returns.
+        self.assertEqual(
+            agent._normalise_build_uuid('aaaa1111-bbbb-2222-cccc-333344445555'),
+            'aaaa1111bbbb2222cccc333344445555',
+        )
+
+    def test_already_normalised_input_round_trips_unchanged(self):
+        # Step 1 (Mach-O LC_UUID via `_extract_uuid_from_app`)
+        # already emits the canonical shape — re-normalising must
+        # be idempotent.
+        canonical = 'aa00000000000000000000000000000033'
+        self.assertEqual(
+            agent._normalise_build_uuid(canonical), canonical,
+        )
+
+    def test_whitespace_only_input_returns_none(self):
+        for raw in ["", "  ", "-", "----", None]:
+            self.assertIsNone(
+                agent._normalise_build_uuid(raw),
+                "whitespace-only %r must coerce to None" % (raw,),
+            )
+
+    def test_emitted_shape_is_32_lowercase_hex(self):
+        # Output contract: exactly 32 characters, all in
+        # `[0-9a-f]`. Catches a mutation that switched to uppercase
+        # or kept dashes.
+        import re
+        for raw in [
+            '54D75FB3-747F-387F-8A93-4EA034B1F8CF',
+            'aaaa1111-bbbb-2222-cccc-333344445555',
+            'ZZ' * 16,  # technically not hex but shape pin
+        ]:
+            out = agent._normalise_build_uuid(raw)
+            if out is None:
+                continue
+            self.assertEqual(len(out), 32, "len(%r) != 32" % out)
+            self.assertEqual(
+                out, out.lower(),
+                "%r contains uppercase chars" % out,
+            )
+            self.assertNotIn('-', out, "%r still contains dashes" % out)
+
 
 class TestFindFirstAbove(unittest.TestCase):
     def test_returns_none_on_empty_start(self):
@@ -1256,7 +1461,11 @@ class TestExtractFirstDwarfUuid(unittest.TestCase):
             with mock.patch.object(agent, 'parseDSYM',
                                    return_value=['ABCDEF12-3456-7890-ABCD-EF1234567890']):
                 uuid = agent._extract_first_dwarf_uuid()
-            self.assertEqual(uuid, 'ABCDEF12-3456-7890-ABCD-EF1234567890')
+            # Normalised via `_normalise_build_uuid` on the way out
+            # (lifted from the per-callsite normalisation that used
+            # to live in run_artifact_upload_flow). Catches a
+            # regression that bypassed the canonical-shape contract.
+            self.assertEqual(uuid, 'abcdef1234567890abcdef1234567890')
 
     def test_skips_empty_and_symlink_dwarf_files(self):
         # Zero-byte file (linker placeholder) AND a symlink — both
@@ -1920,12 +2129,17 @@ class TestResolveVcsMetadata(unittest.TestCase):
         # CI_COMMIT_REF_NAME (the tag name). The historic fallback
         # leaked the tag into the branch column. Post-fix: branch
         # must be absent on tag pipelines.
+        #
+        # Force the Python in-process resolver path with
+        # `resolveCli=None` so a bugsee-cli on the test runner's
+        # PATH doesn't shadow the gate we're actually trying to pin.
         with mock.patch.dict(os.environ, {
             'GITLAB_CI':          'true',
             'CI_COMMIT_SHA':      'gl-tag-sha',
             'CI_COMMIT_TAG':      'v1.0.0',
             'CI_COMMIT_REF_NAME': 'v1.0.0',
-        }, clear=True):
+        }, clear=True), \
+                mock.patch.object(agent, 'resolveCli', return_value=None):
             vcs = agent.resolve_vcs_metadata('/no/working/dir')
         self.assertEqual(vcs['provider'], 'gitlab')
         self.assertNotIn(
@@ -1936,16 +2150,23 @@ class TestResolveVcsMetadata(unittest.TestCase):
     def test_gitlab_branch_pipeline_prefers_ci_commit_branch(self):
         # Modern GitLab (>=12.6) sets both CI_COMMIT_BRANCH and
         # CI_COMMIT_REF_NAME on branch pipelines. The gate must
-        # prefer CI_COMMIT_BRANCH (only set on branch pipelines)
-        # over the more-ambiguous ref-name fallback.
+        # prefer CI_COMMIT_BRANCH over the ref-name fallback. Use
+        # distinct sentinel values so a mutation that flipped the
+        # preference order is observable; force the Python path with
+        # `resolveCli=None`.
         with mock.patch.dict(os.environ, {
             'GITLAB_CI':          'true',
             'CI_COMMIT_SHA':      'gl-branch-sha',
             'CI_COMMIT_BRANCH':   'feature/x',
-            'CI_COMMIT_REF_NAME': 'feature/x',
-        }, clear=True):
+            'CI_COMMIT_REF_NAME': 'from-ref-name-sentinel',
+        }, clear=True), \
+                mock.patch.object(agent, 'resolveCli', return_value=None):
             vcs = agent.resolve_vcs_metadata('/no/working/dir')
-        self.assertEqual(vcs['branch'], 'feature/x')
+        self.assertEqual(
+            vcs['branch'], 'feature/x',
+            "gate must prefer CI_COMMIT_BRANCH; got the ref-name sentinel"
+            " instead — preference order regressed",
+        )
 
     def test_bitbucket_pr(self):
         with mock.patch.dict(os.environ, {
