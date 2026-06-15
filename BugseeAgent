@@ -56,7 +56,7 @@ import fnmatch
 # cross-platform build-info contributor SPI.
 # ──────────────────────────────────────────────────────────────────
 
-BUGSEE_CLI_DEFAULT_VERSION = "0.1.1"
+BUGSEE_CLI_DEFAULT_VERSION = "0.2.0"
 BUGSEE_CLI_DOWNLOAD_BASE = "https://download.bugsee.com/cli"
 # Strict version-string shape: SemVer-ish `<major>.<minor>.<patch>`
 # optionally followed by `-<prerelease>`. This regex gates any value
