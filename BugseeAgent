@@ -2188,6 +2188,53 @@ def run_artifact_upload_flow(app_token, endpoint, app_path,
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
+def _upload_build_info_bundle(upload_url, deps_gz, timings_gz):
+    """Ship the build-info components as ONE zstd bundle via
+    `bugsee-cli upload build-info --upload-url <url>` (pre-signed mode:
+    the plugin already registered the build, so the CLI just PUTs).
+
+    `deps_gz` / `timings_gz` are the gzipped per-blob payloads; they're
+    gunzipped here because the bundle's `dependencies.json` /
+    `timings.json` entries carry RAW JSON (the CLI does the zstd packing
+    and the worker re-gzips on store, so the stored bytes match the legacy
+    per-blob path). At least one must be non-None.
+
+    Returns True on success. Returns False on ANY failure — including no
+    resolvable CLI — so the caller falls back to the legacy per-blob gzip
+    PUTs, which target independent presigned URLs (an independent upload
+    mechanism, so retrying them is worthwhile even on a substantive
+    bundle failure).
+    """
+    cli = resolveCli(getattr(options, 'cli_path', None),
+                     getattr(options, 'cli_version', None))
+    if not cli:
+        return False
+    tmpdir = tempfile.mkdtemp(prefix='bugsee-build-info-')
+    try:
+        argv = [cli, "upload", "build-info", "--upload-url", upload_url]
+        if deps_gz is not None:
+            deps_path = os.path.join(tmpdir, "dependencies.json")
+            with open(deps_path, 'wb') as fp:
+                fp.write(gzip.decompress(deps_gz))
+            argv += ["--deps", deps_path]
+        if timings_gz is not None:
+            timings_path = os.path.join(tmpdir, "timings.json")
+            with open(timings_path, 'wb') as fp:
+                fp.write(gzip.decompress(timings_gz))
+            argv += ["--timings", timings_path]
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=120, check=False)
+        stderr = (result.stderr or '').strip()
+        if stderr:
+            print("Bugsee: bugsee-cli output:\n%s" % stderr)
+        return result.returncode == 0
+    except _CLI_CATCHALL_EXCEPTIONS as e:
+        print("Bugsee: build-info bundle CLI invocation failed: %s" % e)
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def _run_dependencies_pipeline(app_token, project_root):
     """Top-level driver wired into [main] when --deps is enabled.
 
@@ -2264,6 +2311,12 @@ def _run_dependencies_pipeline(app_token, project_root):
     body["request_artifact_upload"]      = False
     body["request_dependencies_upload"]  = have_deps
     body["request_timings_upload"]       = timings_gz is not None
+    # Opt into the converged build-info bundle (Phase D). The server only
+    # signs a build_info_upload_endpoint when the org's
+    # BUGSEE_FEATURE_BUILD_INFO_BUNDLE_ENABLED flag is on; the deps/timings
+    # flags above stay set so the legacy path remains available for
+    # fallback (and for non-flagged orgs) during the soak.
+    body["request_build_info_upload"]    = have_deps or have_timings
 
     deps_blob_gz = None
     if have_deps:
@@ -2286,6 +2339,22 @@ def _run_dependencies_pipeline(app_token, project_root):
         app_token, options.endpoint, json.dumps(body))
     if not response:
         return False
+
+    # Build-info bundle (Phase D): when the server signed a
+    # build_info_upload_endpoint (the org is flagged on), the escape hatch
+    # is off, and a CLI resolves, ship deps+timings as ONE zstd bundle via
+    # `bugsee-cli upload build-info` instead of the two legacy gzip PUTs.
+    # Fails closed — any miss/failure falls through to the legacy PUTs.
+    build_info_endpoint = response.get('build_info_upload_endpoint')
+    if (build_info_endpoint
+            and not _env_truthy(os.environ.get('BUGSEE_LEGACY_BUILDINFO_GZIP'))
+            and (have_deps or have_timings)):
+        if _upload_build_info_bundle(
+                build_info_endpoint, deps_blob_gz, timings_gz):
+            print("Bugsee: build-info bundle uploaded via bugsee-cli.")
+            return True
+        print("Bugsee: build-info bundle unavailable/failed; falling back "
+              "to legacy per-blob upload.")
 
     overall_ok = True
 

@@ -20,9 +20,11 @@ Or directly:
     python3 -m unittest test.test_bugsee_cli_migration -v
 """
 
+import gzip
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import re
 import shutil
@@ -1080,6 +1082,335 @@ class TestMainIntegration(unittest.TestCase):
         for cmd in cli_calls:
             self.assertEqual(cmd[cmd.index("--version") + 1], "9.9")
             self.assertEqual(cmd[cmd.index("--build") + 1], "777")
+
+
+# ──────────────────────────────────────────────────────────────────
+# _upload_build_info_bundle — Phase D converged build-info upload via
+# `bugsee-cli upload build-info --upload-url <url>` (pre-signed mode).
+#
+# The plugin already registered the build, so the CLI just PUTs the
+# bundle to the signed URL. deps_gz / timings_gz are the gzipped
+# per-blob payloads; the helper gunzips them into temp
+# `dependencies.json` / `timings.json` (RAW JSON — the CLI does the
+# zstd packing, the worker re-gzips on store). The tempdir is deleted
+# in `finally`, so any assertion about the written bytes MUST happen
+# inside the subprocess.run side_effect (while the files still exist).
+# ──────────────────────────────────────────────────────────────────
+class TestUploadBuildInfoBundle(unittest.TestCase):
+    def setUp(self):
+        # The helper reads `options.cli_path` / `options.cli_version`
+        # via getattr with a None default; a bare MagicMock would make
+        # those attributes truthy MagicMocks, so pin them explicitly.
+        self.options = MagicMock()
+        self.options.cli_path = None
+        self.options.cli_version = None
+        agent.options = self.options
+
+    def test_argv_shape_and_gunzipped_bytes_both_present(self):
+        deps_raw = b'{"dependencies":[{"name":"Alamofire"}]}'
+        timings_raw = b'{"tasks":[{"name":"CompileSwift","ms":1234}]}'
+        deps_gz = gzip.compress(deps_raw)
+        timings_gz = gzip.compress(timings_raw)
+
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            # The tempdir is wiped in finally; read the files NOW.
+            captured['argv'] = list(argv)
+            deps_idx = argv.index('--deps')
+            timings_idx = argv.index('--timings')
+            with open(argv[deps_idx + 1], 'rb') as fp:
+                captured['deps_bytes'] = fp.read()
+            with open(argv[timings_idx + 1], 'rb') as fp:
+                captured['timings_bytes'] = fp.read()
+            return MagicMock(returncode=0, stderr='')
+
+        with patch.object(agent, 'resolveCli', return_value='/cli'), \
+             patch.object(agent.subprocess, 'run', side_effect=fake_run):
+            ok = agent._upload_build_info_bundle(
+                'https://signed.example/build-info', deps_gz, timings_gz)
+
+        self.assertTrue(ok)
+        argv = captured['argv']
+        # The first five tokens are fixed; the --deps/--timings file
+        # paths are tempdir-relative so assert structurally.
+        self.assertEqual(argv[:5],
+                         ['/cli', 'upload', 'build-info', '--upload-url',
+                          'https://signed.example/build-info'])
+        deps_idx = argv.index('--deps')
+        timings_idx = argv.index('--timings')
+        self.assertTrue(argv[deps_idx + 1].endswith('dependencies.json'))
+        self.assertTrue(argv[timings_idx + 1].endswith('timings.json'))
+        # Exactly the 9 tokens, nothing extra.
+        self.assertEqual(len(argv), 9)
+        # The CLI must see RAW (gunzipped) JSON, not the gzip bytes.
+        self.assertEqual(captured['deps_bytes'], deps_raw)
+        self.assertEqual(captured['timings_bytes'], timings_raw)
+
+    def test_argv_full_equality_both_present(self):
+        # Stronger pin: with deterministic file paths captured from the
+        # side_effect, the entire argv equals the expected list.
+        deps_gz = gzip.compress(b'{"d":1}')
+        timings_gz = gzip.compress(b'{"t":2}')
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured['argv'] = list(argv)
+            return MagicMock(returncode=0, stderr='')
+
+        with patch.object(agent, 'resolveCli', return_value='/cli'), \
+             patch.object(agent.subprocess, 'run', side_effect=fake_run):
+            agent._upload_build_info_bundle('URL', deps_gz, timings_gz)
+
+        argv = captured['argv']
+        deps_path = argv[argv.index('--deps') + 1]
+        timings_path = argv[argv.index('--timings') + 1]
+        self.assertEqual(argv, [
+            '/cli', 'upload', 'build-info', '--upload-url', 'URL',
+            '--deps', deps_path,
+            '--timings', timings_path,
+        ])
+
+    def test_deps_only_omits_timings_flag(self):
+        deps_raw = b'{"only":"deps"}'
+        deps_gz = gzip.compress(deps_raw)
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured['argv'] = list(argv)
+            deps_idx = argv.index('--deps')
+            with open(argv[deps_idx + 1], 'rb') as fp:
+                captured['deps_bytes'] = fp.read()
+            return MagicMock(returncode=0, stderr='')
+
+        with patch.object(agent, 'resolveCli', return_value='/cli'), \
+             patch.object(agent.subprocess, 'run', side_effect=fake_run):
+            ok = agent._upload_build_info_bundle('URL', deps_gz, None)
+
+        self.assertTrue(ok)
+        argv = captured['argv']
+        self.assertIn('--deps', argv)
+        self.assertNotIn('--timings', argv)
+        self.assertEqual(captured['deps_bytes'], deps_raw)
+
+    def test_timings_only_omits_deps_flag(self):
+        timings_raw = b'{"only":"timings"}'
+        timings_gz = gzip.compress(timings_raw)
+        captured = {}
+
+        def fake_run(argv, **kwargs):
+            captured['argv'] = list(argv)
+            timings_idx = argv.index('--timings')
+            with open(argv[timings_idx + 1], 'rb') as fp:
+                captured['timings_bytes'] = fp.read()
+            return MagicMock(returncode=0, stderr='')
+
+        with patch.object(agent, 'resolveCli', return_value='/cli'), \
+             patch.object(agent.subprocess, 'run', side_effect=fake_run):
+            ok = agent._upload_build_info_bundle('URL', None, timings_gz)
+
+        self.assertTrue(ok)
+        argv = captured['argv']
+        self.assertIn('--timings', argv)
+        self.assertNotIn('--deps', argv)
+        self.assertEqual(captured['timings_bytes'], timings_raw)
+
+    def test_returns_false_on_nonzero_exit(self):
+        deps_gz = gzip.compress(b'{}')
+        with patch.object(agent, 'resolveCli', return_value='/cli'), \
+             patch.object(agent.subprocess, 'run',
+                          return_value=MagicMock(returncode=30, stderr='')):
+            self.assertFalse(
+                agent._upload_build_info_bundle('URL', deps_gz, None))
+
+    def test_returns_true_on_zero_exit(self):
+        deps_gz = gzip.compress(b'{}')
+        with patch.object(agent, 'resolveCli', return_value='/cli'), \
+             patch.object(agent.subprocess, 'run',
+                          return_value=MagicMock(returncode=0, stderr='')):
+            self.assertTrue(
+                agent._upload_build_info_bundle('URL', deps_gz, None))
+
+    def test_returns_false_when_no_cli_and_subprocess_not_called(self):
+        deps_gz = gzip.compress(b'{}')
+        with patch.object(agent, 'resolveCli', return_value=None), \
+             patch.object(agent.subprocess, 'run') as mock_run:
+            self.assertFalse(
+                agent._upload_build_info_bundle('URL', deps_gz, None))
+            mock_run.assert_not_called()
+
+    def test_returns_false_on_subprocess_exception(self):
+        deps_gz = gzip.compress(b'{}')
+        with patch.object(agent, 'resolveCli', return_value='/cli'), \
+             patch.object(agent.subprocess, 'run',
+                          side_effect=OSError("ENOEXEC")):
+            self.assertFalse(
+                agent._upload_build_info_bundle('URL', deps_gz, None))
+
+
+# ──────────────────────────────────────────────────────────────────
+# _run_dependencies_pipeline routing — bundle vs legacy per-blob PUTs.
+#
+# We mock the collectors + registration so the test focuses purely on
+# the branch: does the function ship one bundle (Phase D) or two legacy
+# gzip PUTs? The bundle is chosen when the server signs a
+# `build_info_upload_endpoint`, the BUGSEE_LEGACY_BUILDINFO_GZIP escape
+# hatch is OFF, and at least one of deps/timings is present.
+# ──────────────────────────────────────────────────────────────────
+class TestRunDependenciesPipelineRouting(unittest.TestCase):
+    def setUp(self):
+        self.options = MagicMock()
+        self.options.collect_deps = True
+        self.options.collect_timings = True
+        self.options.endpoint = 'https://apidev.bugsee.com'
+        self.options.project_root = '/proj'
+        self.options.cli_path = None
+        self.options.cli_version = None
+        agent.options = self.options
+
+    def _patches(self, registration_response):
+        """Common collector/registration mocks. Deps + timings both
+        present so the routing decision is the only variable."""
+        return [
+            patch.object(agent, '_collect_all_dependencies',
+                         return_value=([{'name': 'A'}], 'all', False)),
+            patch.object(agent, 'resolve_build_timings',
+                         return_value=({'total_ms': 10}, gzip.compress(b'{"t":1}'))),
+            patch.object(agent, '_collect_build_metadata', return_value={}),
+            patch.object(agent, '_extract_first_dwarf_uuid', return_value=None),
+            patch.object(agent, '_build_dependencies_payload',
+                         return_value=({'total': 1}, {'dependencies': [{'name': 'A'}]})),
+            patch.object(agent, '_request_build_registration',
+                         return_value=registration_response),
+        ]
+
+    def test_bundle_used_when_endpoint_present(self):
+        resp = {
+            'build_info_upload_endpoint': 'https://signed/build-info',
+            'dependencies_upload_endpoint': 'https://signed/deps',
+            'timings_upload_endpoint': 'https://signed/timings',
+        }
+        bundle = MagicMock(return_value=True)
+        deps_put = MagicMock(return_value=True)
+        timings_put = MagicMock(return_value=True)
+        ctx = self._patches(resp) + [
+            patch.object(agent, '_upload_build_info_bundle', bundle),
+            patch.object(agent, '_put_dependencies_blob', deps_put),
+            patch.object(agent, '_put_timings_blob', timings_put),
+            patch.dict(agent.os.environ, {}, clear=False),
+        ]
+        # Ensure the escape hatch is OFF.
+        with patch.dict(agent.os.environ,
+                        {'BUGSEE_LEGACY_BUILDINFO_GZIP': ''}, clear=False):
+            for p in ctx:
+                p.start()
+            try:
+                ok = agent._run_dependencies_pipeline('tok', '/proj')
+            finally:
+                for p in reversed(ctx):
+                    p.stop()
+
+        self.assertTrue(ok)
+        bundle.assert_called_once()
+        # First positional arg is the signed build-info endpoint.
+        self.assertEqual(bundle.call_args[0][0], 'https://signed/build-info')
+        # Legacy per-blob PUTs MUST be skipped when the bundle wins.
+        deps_put.assert_not_called()
+        timings_put.assert_not_called()
+
+    def test_legacy_used_when_endpoint_absent(self):
+        resp = {
+            'dependencies_upload_endpoint': 'https://signed/deps',
+            'timings_upload_endpoint': 'https://signed/timings',
+        }
+        bundle = MagicMock(return_value=True)
+        deps_put = MagicMock(return_value=True)
+        timings_put = MagicMock(return_value=True)
+        ctx = self._patches(resp) + [
+            patch.object(agent, '_upload_build_info_bundle', bundle),
+            patch.object(agent, '_put_dependencies_blob', deps_put),
+            patch.object(agent, '_put_timings_blob', timings_put),
+        ]
+        with patch.dict(agent.os.environ,
+                        {'BUGSEE_LEGACY_BUILDINFO_GZIP': ''}, clear=False):
+            for p in ctx:
+                p.start()
+            try:
+                ok = agent._run_dependencies_pipeline('tok', '/proj')
+            finally:
+                for p in reversed(ctx):
+                    p.stop()
+
+        self.assertTrue(ok)
+        bundle.assert_not_called()
+        deps_put.assert_called_once()
+        timings_put.assert_called_once()
+
+    def test_legacy_used_when_escape_hatch_set(self):
+        resp = {
+            'build_info_upload_endpoint': 'https://signed/build-info',
+            'dependencies_upload_endpoint': 'https://signed/deps',
+            'timings_upload_endpoint': 'https://signed/timings',
+        }
+        bundle = MagicMock(return_value=True)
+        deps_put = MagicMock(return_value=True)
+        timings_put = MagicMock(return_value=True)
+        ctx = self._patches(resp) + [
+            patch.object(agent, '_upload_build_info_bundle', bundle),
+            patch.object(agent, '_put_dependencies_blob', deps_put),
+            patch.object(agent, '_put_timings_blob', timings_put),
+        ]
+        with patch.dict(agent.os.environ,
+                        {'BUGSEE_LEGACY_BUILDINFO_GZIP': '1'}, clear=False):
+            for p in ctx:
+                p.start()
+            try:
+                ok = agent._run_dependencies_pipeline('tok', '/proj')
+            finally:
+                for p in reversed(ctx):
+                    p.stop()
+
+        self.assertTrue(ok)
+        # Escape hatch forces the legacy path even though the endpoint
+        # was signed.
+        bundle.assert_not_called()
+        deps_put.assert_called_once()
+        timings_put.assert_called_once()
+
+    def test_request_build_info_upload_flag_set_in_body(self):
+        # The registration body must opt into the bundle so the server
+        # knows to sign the endpoint. Capture the JSON the agent POSTs.
+        captured = {}
+
+        def fake_register(app_token, endpoint, body_json):
+            captured['body'] = json.loads(body_json)
+            return {'build_info_upload_endpoint': 'https://signed/build-info'}
+
+        ctx = [
+            patch.object(agent, '_collect_all_dependencies',
+                         return_value=([{'name': 'A'}], 'all', False)),
+            patch.object(agent, 'resolve_build_timings',
+                         return_value=({'total_ms': 10}, gzip.compress(b'{"t":1}'))),
+            patch.object(agent, '_collect_build_metadata', return_value={}),
+            patch.object(agent, '_extract_first_dwarf_uuid', return_value=None),
+            patch.object(agent, '_build_dependencies_payload',
+                         return_value=({'total': 1}, {'dependencies': []})),
+            patch.object(agent, '_request_build_registration',
+                         side_effect=fake_register),
+            patch.object(agent, '_upload_build_info_bundle',
+                         return_value=True),
+        ]
+        with patch.dict(agent.os.environ,
+                        {'BUGSEE_LEGACY_BUILDINFO_GZIP': ''}, clear=False):
+            for p in ctx:
+                p.start()
+            try:
+                agent._run_dependencies_pipeline('tok', '/proj')
+            finally:
+                for p in reversed(ctx):
+                    p.stop()
+
+        self.assertTrue(captured['body'].get('request_build_info_upload'))
 
 
 if __name__ == "__main__":
