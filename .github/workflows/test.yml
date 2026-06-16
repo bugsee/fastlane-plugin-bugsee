@@ -56,3 +56,49 @@ jobs:
         # Run both test modules in one invocation so the discovery
         # output is single-pane in the GitHub log.
         run: python3 -B -u -m unittest test.test_bugsee_agent test.test_bugsee_cli_migration
+
+  integration:
+    # REAL round-trip test: the action shells out to BugseeAgent which
+    # shells out to the native bugsee-cli, which performs a real HTTP
+    # two-stage upload against a local socket mock the spec stands up.
+    # This is the only job that exercises the live CLI binary, so it
+    # downloads the published Linux build rather than relying on a
+    # checked-in or auto-downloaded one.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          # Match the `ruby` job's toolchain so the integration run
+          # exercises the same Ruby the unit suite is pinned to.
+          ruby-version: '3.1'
+          bundler-cache: true
+      - name: Download bugsee-cli (Linux x86_64)
+        # Fetch the published 0.3.0 Linux binary and verify it against
+        # the .sha256 sidecar BEFORE executing it — a tampered or
+        # truncated download must fail the job, not silently run.
+        # The tarball expands to bugsee-cli-<triple>/bugsee-cli; we
+        # locate the binary by name rather than hard-coding the dir.
+        run: |
+          set -euo pipefail
+          base="https://download.bugsee.com/cli/v0.3.0"
+          file="bugsee-cli-x86_64-unknown-linux-gnu.tar.xz"
+          curl -fsSL "$base/$file" -o "$file"
+          curl -fsSL "$base/$file.sha256" -o "$file.sha256"
+          sha256sum -c "$file.sha256"
+          tar -xf "$file"
+          cli="$(find . -type f -name bugsee-cli | head -n1)"
+          if [ -z "$cli" ]; then
+            echo "bugsee-cli binary not found in extracted tarball" >&2
+            exit 1
+          fi
+          chmod +x "$cli"
+          cli_abs="$(cd "$(dirname "$cli")" && pwd)/$(basename "$cli")"
+          echo "BUGSEE_CLI_PATH=$cli_abs" >> "$GITHUB_ENV"
+          "$cli_abs" --version
+      - name: rspec (integration)
+        # RUN_INTEGRATION=1 flips spec_helper.rb to INCLUDE :integration
+        # specs; the --tag narrows the run to just them. BUGSEE_CLI_PATH
+        # (set above into $GITHUB_ENV) is what the spec resolves and
+        # forwards to the action's cli_path:.
+        run: RUN_INTEGRATION=1 bundle exec rspec --tag integration spec/integration
