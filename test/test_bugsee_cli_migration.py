@@ -174,8 +174,11 @@ class TestResolveCli(unittest.TestCase):
 
     def test_cache_hit_returns_immediately_without_download(self):
         triple = "aarch64-apple-darwin"
+        # Track the agent's actual default version rather than a hard-coded
+        # literal, so repinning BUGSEE_CLI_DEFAULT_VERSION can't break this.
         cache_bin = os.path.join(
-            self.fake_home, ".bugsee", "cli", "0.1.1", triple, "bugsee-cli",
+            self.fake_home, ".bugsee", "cli",
+            agent.BUGSEE_CLI_DEFAULT_VERSION, triple, "bugsee-cli",
         )
         self._make_executable(cache_bin)
         with patch.object(agent, "detectHostTriple", return_value=triple), \
@@ -292,12 +295,14 @@ class TestResolveCli(unittest.TestCase):
 
     def test_download_succeeds_then_binary_returned(self):
         triple = "aarch64-apple-darwin"
-        cache_dir = os.path.join(self.fake_home, ".bugsee", "cli", "0.1.1", triple)
+        # Track the agent's actual default version (see cache-hit test).
+        default_version = agent.BUGSEE_CLI_DEFAULT_VERSION
+        cache_dir = os.path.join(self.fake_home, ".bugsee", "cli", default_version, triple)
         cache_bin = os.path.join(cache_dir, "bugsee-cli")
 
         def fake_download(version, target_triple, target_dir):
             # Simulate what _downloadCli does on success.
-            self.assertEqual(version, "0.1.1")
+            self.assertEqual(version, default_version)
             self.assertEqual(target_triple, triple)
             self.assertEqual(target_dir, cache_dir)
             self._make_executable(cache_bin)

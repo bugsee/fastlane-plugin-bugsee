@@ -2063,6 +2063,18 @@ class TestLocalHostname(unittest.TestCase):
 
 
 class TestResolveMachineLabel(unittest.TestCase):
+    def setUp(self):
+        # These tests exercise the pure-Python env-based fallback cascade.
+        # resolve_machine_label() PREFERS `bugsee-cli build-env machine-label`,
+        # and on a CI runner (where the CLI auto-downloads successfully) that
+        # path answers first with the runner's real hostname — masking the
+        # cascade and making `test_no_provider...` flap to the runner host.
+        # Stub the CLI path to None so the Python fallback is what's under test.
+        p = mock.patch.object(agent, '_resolve_machine_label_via_cli',
+                              return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_github_actions_with_runner_name(self):
         # Provider precedence is highest signal first; GITHUB_ACTIONS
         # must NOT lose to a generic CI=true falling through.
