@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import ANY, MagicMock, patch
 
@@ -126,14 +127,25 @@ class TestResolveCli(unittest.TestCase):
             "HOME": os.environ.get("HOME"),
             "BUGSEE_CLI_PATH": os.environ.get("BUGSEE_CLI_PATH"),
             "BUGSEE_CLI_VERSION": os.environ.get("BUGSEE_CLI_VERSION"),
+            "BUGSEE_CLI_AUTO_UPDATE": os.environ.get("BUGSEE_CLI_AUTO_UPDATE"),
         }
         os.environ["HOME"] = self.fake_home
         os.environ.pop("BUGSEE_CLI_PATH", None)
         os.environ.pop("BUGSEE_CLI_VERSION", None)
+        # Disable the auto-update network pointer check for the existing
+        # default-version resolution tests so they deterministically use
+        # BUGSEE_CLI_DEFAULT_VERSION (the floor) as the cache dir without
+        # reaching out to download.bugsee.com. The auto-update path has
+        # its own dedicated coverage (TestAutoUpdateContract /
+        # TestResolveEffectiveVersion below).
+        os.environ["BUGSEE_CLI_AUTO_UPDATE"] = "0"
         # `resolveCli` caches its results for the lifetime of the
         # process. Each test mutates env + fake home, so wipe the
         # cache to keep tests independent of execution order.
         agent._resolveCli_cache.clear()
+        # Reset the once-per-process self-update guard so a managed-binary
+        # resolution in one test doesn't suppress it in the next.
+        agent._self_update_done = False
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1416,6 +1428,232 @@ class TestRunDependenciesPipelineRouting(unittest.TestCase):
                     p.stop()
 
         self.assertTrue(captured['body'].get('request_build_info_upload'))
+
+
+# ──────────────────────────────────────────────────────────────────
+# CLI version-string validation. The same X.Y.Z[-prerelease] regex
+# gates BUGSEE_CLI_VERSION before it flows into a download URL or the
+# on-disk cache path (path-traversal / URL-injection guard). Version
+# DISCOVERY is no longer hand-rolled here — the CLI's own `update`
+# command owns it (see TestSelfUpdate / TestResolveCliSelfUpdateWiring).
+# ──────────────────────────────────────────────────────────────────
+class TestCliVersionValidation(unittest.TestCase):
+    def test_default_version_is_floor(self):
+        # Pin the download floor so a silent bump surfaces in review.
+        self.assertEqual(agent.BUGSEE_CLI_DEFAULT_VERSION, "0.6.0")
+
+    def test_accepts_plain_semver_and_prerelease(self):
+        self.assertTrue(agent._BUGSEE_CLI_VERSION_RE.fullmatch("0.5.0"))
+        self.assertTrue(agent._BUGSEE_CLI_VERSION_RE.fullmatch("1.2.3-rc.1"))
+
+    def test_rejects_path_traversal_and_slash(self):
+        self.assertIsNone(
+            agent._BUGSEE_CLI_VERSION_RE.fullmatch("1.0/../evil"))
+        self.assertIsNone(agent._BUGSEE_CLI_VERSION_RE.fullmatch("1/2/3"))
+        self.assertIsNone(agent._BUGSEE_CLI_VERSION_RE.fullmatch("garbage"))
+
+
+# ──────────────────────────────────────────────────────────────────
+# CLI self-update — `_maybe_self_update` shells `bugsee-cli update
+# --max-age 12h` BEST-EFFORT on a binary the agent manages. The CLI
+# owns version discovery, download + verify, in-place self-replace,
+# and the ~12h throttle. This helper must: fire the right argv, run at
+# most once per process, skip when disabled, and swallow EVERY failure
+# (timeout / non-zero exit / exec error) without raising.
+# ──────────────────────────────────────────────────────────────────
+class TestSelfUpdate(unittest.TestCase):
+    def setUp(self):
+        self._old_au = os.environ.get("BUGSEE_CLI_AUTO_UPDATE")
+        os.environ.pop("BUGSEE_CLI_AUTO_UPDATE", None)
+        agent._self_update_done = False
+
+    def tearDown(self):
+        agent._self_update_done = False
+        if self._old_au is None:
+            os.environ.pop("BUGSEE_CLI_AUTO_UPDATE", None)
+        else:
+            os.environ["BUGSEE_CLI_AUTO_UPDATE"] = self._old_au
+
+    def test_fires_update_with_max_age_12h(self):
+        with patch.object(agent.subprocess, "run") as run_mock:
+            agent._maybe_self_update("/managed/bugsee-cli")
+        run_mock.assert_called_once()
+        argv = run_mock.call_args[0][0]
+        self.assertEqual(
+            argv, ["/managed/bugsee-cli", "update", "--max-age", "12h"])
+        # A generous timeout + non-raising exit-code policy.
+        kwargs = run_mock.call_args[1]
+        self.assertEqual(kwargs.get("timeout"), 120)
+        self.assertFalse(kwargs.get("check"))
+        # Never leak the CLI's stdout into the build log.
+        self.assertEqual(kwargs.get("stdout"), agent.subprocess.DEVNULL)
+
+    def test_runs_at_most_once_per_process(self):
+        with patch.object(agent.subprocess, "run") as run_mock:
+            agent._maybe_self_update("/managed/bugsee-cli")
+            agent._maybe_self_update("/managed/bugsee-cli")
+            agent._maybe_self_update("/managed/bugsee-cli")
+        self.assertEqual(run_mock.call_count, 1)
+
+    def test_skips_when_auto_update_disabled(self):
+        os.environ["BUGSEE_CLI_AUTO_UPDATE"] = "off"
+        with patch.object(agent.subprocess, "run") as run_mock:
+            agent._maybe_self_update("/managed/bugsee-cli")
+        run_mock.assert_not_called()
+
+    def test_skips_when_cli_path_falsy(self):
+        with patch.object(agent.subprocess, "run") as run_mock:
+            agent._maybe_self_update(None)
+        run_mock.assert_not_called()
+
+    def test_swallows_timeout(self):
+        with patch.object(
+                agent.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired(cmd="x", timeout=120)):
+            # Must NOT raise.
+            agent._maybe_self_update("/managed/bugsee-cli")
+
+    def test_swallows_arbitrary_exception(self):
+        with patch.object(agent.subprocess, "run",
+                          side_effect=OSError("exec failed")):
+            agent._maybe_self_update("/managed/bugsee-cli")
+
+    def test_nonzero_exit_is_ignored(self):
+        # A non-zero return code never raises (check=False) and is not
+        # inspected — the binary is still considered usable.
+        with patch.object(agent.subprocess, "run",
+                          return_value=MagicMock(returncode=7)):
+            agent._maybe_self_update("/managed/bugsee-cli")  # no raise
+
+
+# ──────────────────────────────────────────────────────────────────
+# Self-update wiring into `_resolveCli_uncached`. After the agent
+# resolves a binary via the DOWNLOAD path (managed binary), it must
+# run `_maybe_self_update` on it. It must NOT self-update a PATH /
+# explicit BUGSEE_CLI_PATH binary, and must skip self-update entirely
+# when auto-update is disabled.
+# ──────────────────────────────────────────────────────────────────
+class TestResolveCliSelfUpdateWiring(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.fake_home = os.path.join(self.tmp, "home")
+        os.makedirs(self.fake_home, exist_ok=True)
+        self._old_env = {
+            k: os.environ.get(k) for k in (
+                "HOME", "BUGSEE_CLI_PATH", "BUGSEE_CLI_VERSION",
+                "BUGSEE_CLI_AUTO_UPDATE")
+        }
+        os.environ["HOME"] = self.fake_home
+        for k in ("BUGSEE_CLI_PATH", "BUGSEE_CLI_VERSION",
+                  "BUGSEE_CLI_AUTO_UPDATE"):
+            os.environ.pop(k, None)
+        agent._resolveCli_cache.clear()
+        agent._self_update_done = False
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        agent._self_update_done = False
+        for k, v in self._old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _make_executable(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\nexit 0\n")
+        os.chmod(path, 0o755)
+
+    def test_self_update_called_on_downloaded_binary(self):
+        # No explicit path → the agent downloads the floor into the
+        # managed cache dir, then self-updates THAT binary.
+        triple = "aarch64-apple-darwin"
+        cache_dir = os.path.join(
+            self.fake_home, ".bugsee", "cli",
+            agent.BUGSEE_CLI_DEFAULT_VERSION, triple)
+        cache_bin = os.path.join(cache_dir, "bugsee-cli")
+
+        def fake_download(version, target_triple, target_dir):
+            self._make_executable(cache_bin)
+
+        with patch.object(agent, "detectHostTriple", return_value=triple), \
+             patch.object(agent, "_downloadCli", side_effect=fake_download), \
+             patch.object(agent, "_maybe_self_update") as su_mock:
+            self.assertEqual(agent.resolveCli(), cache_bin)
+        su_mock.assert_called_once_with(cache_bin)
+
+    def test_self_update_called_on_cache_hit_managed_binary(self):
+        # A previously-downloaded (managed) binary in the cache is also
+        # eligible for self-update on this run.
+        triple = "aarch64-apple-darwin"
+        cache_bin = os.path.join(
+            self.fake_home, ".bugsee", "cli",
+            agent.BUGSEE_CLI_DEFAULT_VERSION, triple, "bugsee-cli")
+        self._make_executable(cache_bin)
+        with patch.object(agent, "detectHostTriple", return_value=triple), \
+             patch.object(agent, "_downloadCli") as dl_mock, \
+             patch.object(agent, "_maybe_self_update") as su_mock:
+            self.assertEqual(agent.resolveCli(), cache_bin)
+            dl_mock.assert_not_called()
+        su_mock.assert_called_once_with(cache_bin)
+
+    def test_self_update_not_called_for_explicit_cli_path(self):
+        # An explicit BUGSEE_CLI_PATH binary is user/system-managed —
+        # never mutate it.
+        bin_path = os.path.join(self.tmp, "explicit-cli")
+        self._make_executable(bin_path)
+        os.environ["BUGSEE_CLI_PATH"] = bin_path
+        with patch.object(agent, "_maybe_self_update") as su_mock:
+            self.assertEqual(agent.resolveCli(), bin_path)
+        su_mock.assert_not_called()
+
+    def test_self_update_not_called_for_cli_path_arg(self):
+        bin_path = os.path.join(self.tmp, "arg-cli")
+        self._make_executable(bin_path)
+        with patch.object(agent, "_maybe_self_update") as su_mock:
+            self.assertEqual(agent.resolveCli(cliPath=bin_path), bin_path)
+        su_mock.assert_not_called()
+
+    def test_downloaded_binary_returned_even_if_self_update_raises(self):
+        # `_maybe_self_update` must already swallow everything, but pin
+        # that a throwing self-update can't break resolution: the
+        # downloaded binary is still returned.
+        triple = "aarch64-apple-darwin"
+        cache_dir = os.path.join(
+            self.fake_home, ".bugsee", "cli",
+            agent.BUGSEE_CLI_DEFAULT_VERSION, triple)
+        cache_bin = os.path.join(cache_dir, "bugsee-cli")
+
+        def fake_download(version, target_triple, target_dir):
+            self._make_executable(cache_bin)
+
+        # The real _maybe_self_update over a subprocess.run that raises —
+        # resolution must still succeed.
+        with patch.object(agent, "detectHostTriple", return_value=triple), \
+             patch.object(agent, "_downloadCli", side_effect=fake_download), \
+             patch.object(agent.subprocess, "run",
+                          side_effect=OSError("update exec failed")):
+            self.assertEqual(agent.resolveCli(), cache_bin)
+
+    def test_disabled_auto_update_skips_self_update_subprocess(self):
+        # With auto-update OFF, the download still happens (explicit-path
+        # / floor download is independent), but the self-update
+        # subprocess must NOT fire.
+        os.environ["BUGSEE_CLI_AUTO_UPDATE"] = "0"
+        triple = "aarch64-apple-darwin"
+        cache_bin = os.path.join(
+            self.fake_home, ".bugsee", "cli",
+            agent.BUGSEE_CLI_DEFAULT_VERSION, triple, "bugsee-cli")
+        self._make_executable(cache_bin)
+        with patch.object(agent, "detectHostTriple", return_value=triple), \
+             patch.object(agent, "_downloadCli") as dl_mock, \
+             patch.object(agent.subprocess, "run") as run_mock:
+            self.assertEqual(agent.resolveCli(), cache_bin)
+            dl_mock.assert_not_called()
+            # _maybe_self_update ran (cache hit) but bailed before exec
+            # because auto-update is disabled.
+            run_mock.assert_not_called()
 
 
 if __name__ == "__main__":

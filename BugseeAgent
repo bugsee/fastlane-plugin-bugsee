@@ -56,7 +56,12 @@ import fnmatch
 # cross-platform build-info contributor SPI.
 # ──────────────────────────────────────────────────────────────────
 
-BUGSEE_CLI_DEFAULT_VERSION = "0.3.0"
+# Download FLOOR: the CLI version this agent installs on first use.
+# After downloading it, the agent runs `bugsee-cli update --max-age 12h`
+# (see `_maybe_self_update`), letting the CLI bump itself in place to
+# the latest same-major release. Must be >= 0.6.0 — the first release that
+# ships the `update` self-update command this agent relies on.
+BUGSEE_CLI_DEFAULT_VERSION = "0.6.0"
 BUGSEE_CLI_DOWNLOAD_BASE = "https://download.bugsee.com/cli"
 # Strict version-string shape: SemVer-ish `<major>.<minor>.<patch>`
 # optionally followed by `-<prerelease>`. This regex gates any value
@@ -64,6 +69,74 @@ BUGSEE_CLI_DOWNLOAD_BASE = "https://download.bugsee.com/cli"
 # path, so a malicious BUGSEE_CLI_VERSION env var cannot inject `/` or
 # `..` segments to escape the cache root or redirect downloads.
 _BUGSEE_CLI_VERSION_RE = re.compile(r'^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$')
+
+# ──────────────────────────────────────────────────────────────────
+# CLI self-update (delegated to the CLI — shared contract across the
+# fastlane / SDK / gradle / iOS producers)
+#
+# Version discovery is no longer hand-rolled here. After the agent has
+# DOWNLOADED a binary it manages, it runs once per process:
+#
+#   bugsee-cli update --max-age 12h
+#
+# The CLI owns everything: discovering the newest same-major
+# (non-breaking) release, downloading + SHA-256-verifying it, and
+# self-replacing the binary IN PLACE. `--max-age 12h` makes it throttle
+# internally (a last-check timestamp next to the binary; no-op/no-network
+# when fresh) and best-effort (any failure → exit 0). We only self-update
+# a binary we MANAGE (one we auto-downloaded into ~/.bugsee/cli/...),
+# never a PATH / explicit BUGSEE_CLI_PATH one — those may be read-only or
+# shared and must not be mutated. Disable via BUGSEE_CLI_AUTO_UPDATE.
+# ──────────────────────────────────────────────────────────────────
+
+# `--max-age` value handed to `bugsee-cli update`; the CLI throttles its
+# own network check to this freshness window.
+_BUGSEE_CLI_SELF_UPDATE_MAX_AGE = "12h"
+# Generous cap for the self-update subprocess. The CLI is best-effort, so
+# a hang past this is swallowed (TimeoutExpired) and the build proceeds.
+_BUGSEE_CLI_SELF_UPDATE_TIMEOUT_SECONDS = 120
+
+# Process-wide guard so the self-update runs at most once per build phase.
+_self_update_done = False
+
+
+def _bugsee_cli_auto_update_enabled():
+    """Auto-update is ON unless BUGSEE_CLI_AUTO_UPDATE is an explicit
+    off token (`0` / `false` / `no` / `off`, case-insensitive)."""
+    raw = (os.environ.get("BUGSEE_CLI_AUTO_UPDATE") or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _maybe_self_update(cli_path):
+    """Run `bugsee-cli update --max-age 12h` BEST-EFFORT on a binary the
+    agent MANAGES (i.e. one it auto-downloaded into ~/.bugsee/cli/...).
+
+    The CLI owns version discovery (newest same-major release), download
+    + SHA-256 verify, in-place self-replace, and its own ~12h throttle
+    (a last-check timestamp next to the binary; no-op/no-network when
+    fresh). This call therefore just fires the command and forgets: it
+    swallows EVERYTHING (timeout, non-zero exit, exec failure), NEVER
+    raises, and never prints to stdout. Memoized to run at most once per
+    process. Skipped when BUGSEE_CLI_AUTO_UPDATE is disabled."""
+    global _self_update_done
+    if _self_update_done:
+        return
+    _self_update_done = True
+    if not cli_path or not _bugsee_cli_auto_update_enabled():
+        return
+    try:
+        subprocess.run(
+            [cli_path, "update", "--max-age",
+             _BUGSEE_CLI_SELF_UPDATE_MAX_AGE],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=_BUGSEE_CLI_SELF_UPDATE_TIMEOUT_SECONDS, check=False,
+        )
+    except Exception:
+        # Best-effort: a hung / failing / missing CLI must never break or
+        # slow the build. Ignore the return code and any exception
+        # (TimeoutExpired included).
+        pass
+
 
 # Exception tuple every CLI-shelling helper catches. Pinned in one
 # place so all of `_resolve_*_via_cli` / `_collect_*_via_cli` /
@@ -159,7 +232,13 @@ def _resolveCli_uncached(cliPath=None, cliVersion=None):
             return explicit
         print("Bugsee: --cli-path %s is not an executable file; trying auto-download" % explicit)
 
-    version = cliVersion or os.environ.get("BUGSEE_CLI_VERSION") or BUGSEE_CLI_DEFAULT_VERSION
+    # An explicit version (arg or env) is honoured EXACTLY. Otherwise we
+    # download the pinned floor; version discovery (bumping to the latest
+    # same-major release) is delegated to the CLI's own `update` command
+    # via `_maybe_self_update` after the download succeeds — the agent no
+    # longer hand-rolls it.
+    explicit_version = cliVersion or os.environ.get("BUGSEE_CLI_VERSION")
+    version = explicit_version or BUGSEE_CLI_DEFAULT_VERSION
     # Strict version-string validation BEFORE the value flows into the
     # download URL and the on-disk cache path. Without this, anyone who
     # can set BUGSEE_CLI_VERSION (a malicious CI step, a poisoned .env,
@@ -180,7 +259,10 @@ def _resolveCli_uncached(cliPath=None, cliVersion=None):
     binary_name = "bugsee-cli.exe" if "windows" in triple else "bugsee-cli"
     cached = os.path.join(cache_root, binary_name)
 
+    # Cache hit — the binary was auto-downloaded on a prior run and is one
+    # we manage, so it's eligible for self-update.
     if os.path.isfile(cached) and os.access(cached, os.X_OK):
+        _maybe_self_update(cached)
         return cached
 
     try:
@@ -191,6 +273,10 @@ def _resolveCli_uncached(cliPath=None, cliVersion=None):
         return None
 
     if os.path.isfile(cached) and os.access(cached, os.X_OK):
+        # Freshly downloaded → a binary we manage; let the CLI bump it in
+        # place to the latest same-major release (best-effort, once per
+        # process). Never run on a PATH / BUGSEE_CLI_PATH binary.
+        _maybe_self_update(cached)
         return cached
     return None
 
