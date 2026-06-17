@@ -959,7 +959,7 @@ _OTOOL_SAMPLE = (
     "/private/var/staging/MyApp.app/MyApp:\n"
     "\t@rpath/Bugsee.framework/Bugsee (compatibility version 1.0.0, current version 1.0.0)\n"
     "\t@rpath/Alamofire.framework/Alamofire (compatibility version 1.0.0, current version 5.8.0)\n"
-    "\t@executable_path/Frameworks/Sentry.framework/Sentry (compatibility version 1.0.0, current version 8.0.0)\n"
+    "\t@executable_path/Frameworks/Lottie.framework/Lottie (compatibility version 1.0.0, current version 8.0.0)\n"
     "\t/usr/lib/libobjc.A.dylib (compatibility version 1.0.0, current version 228.0.0)\n"
     "\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1351.0.0)\n"
     "\t/System/Library/Frameworks/Foundation.framework/Foundation (compatibility version 300.0.0, current version 2402.0.0)\n"
@@ -996,7 +996,7 @@ class TestParseVendoredFrameworks(unittest.TestCase):
         # Mach-O slice name) as the entry name.
         self.assertIn('Bugsee.framework', names)
         self.assertIn('Alamofire.framework', names)
-        self.assertIn('Sentry.framework', names)
+        self.assertIn('Lottie.framework', names)
         # System dylibs / Foundation / UIKit are filtered out.
         self.assertNotIn('libobjc.A.dylib', names)
         self.assertNotIn('libSystem.B.dylib', names)
