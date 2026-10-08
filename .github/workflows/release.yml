@@ -1,0 +1,45 @@
+name: release
+
+# Publishes the gem to RubyGems when a version tag (vX.Y.Z) is pushed.
+# Uses RubyGems trusted publishing (OIDC) — no API key or OTP is stored
+# in GitHub. One-time setup on rubygems.org is required, see below.
+#
+#   1. rubygems.org -> fastlane-plugin-bugsee -> Trusted publishers -> add GitHub Actions:
+#        owner: bugsee   repository: fastlane-plugin-bugsee
+#        workflow: release.yml   environment: release
+#   2. GitHub -> repo Settings -> Environments -> create "release"
+#      (optionally require a reviewer to approve each publish).
+#
+# Release flow: bump lib/fastlane/plugin/bugsee/version.rb, merge, then
+#   git tag vX.Y.Z && git push origin vX.Y.Z
+
+on:
+  push:
+    tags: [ 'v[0-9]+.[0-9]+.[0-9]+' ]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write   # RubyGems trusted publishing (OIDC)
+      contents: write   # release-gem pushes/validates the tag
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.1'
+          bundler-cache: true
+      - name: Tag must match version.rb
+        run: |
+          set -euo pipefail
+          v="$(ruby -r ./lib/fastlane/plugin/bugsee/version -e 'puts Fastlane::Bugsee::VERSION')"
+          if [ "v$v" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match version.rb ($v)" >&2
+            exit 1
+          fi
+      - name: rspec
+        run: bundle exec rspec
+      - name: Python tests
+        run: python3 -m unittest discover -s test -t .
+      - uses: rubygems/release-gem@v1
