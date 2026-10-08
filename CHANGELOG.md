@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.1
+
+- Raise the bugsee-cli download floor from 0.6.0 to 0.8.0. The plugin
+  still self-updates the CLI after the first download, but if that step
+  fails (offline, blocked host) it no longer stays on 0.6.0, which
+  silently uploads nothing for NDK `SYMBOL_TABLE` symbols
+  (bugsee-cli#61).
+
 ## 1.1.0
 
 ### dSYM upload now uses bugsee-cli
