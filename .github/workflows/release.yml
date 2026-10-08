@@ -30,6 +30,10 @@ jobs:
         with:
           ruby-version: '3.1'
           bundler-cache: true
+          # release-gem's "await" step runs `gem exec`, which the RubyGems
+          # bundled with Ruby 3.1.7 doesn't have; update RubyGems so the
+          # run doesn't fail after a successful publish.
+          rubygems: latest
       - name: Tag must match version.rb
         run: |
           set -euo pipefail
