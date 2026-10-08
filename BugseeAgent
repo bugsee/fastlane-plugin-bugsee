@@ -60,8 +60,10 @@ import fnmatch
 # After downloading it, the agent runs `bugsee-cli update --max-age 12h`
 # (see `_maybe_self_update`), letting the CLI bump itself in place to
 # the latest same-major release. Must be >= 0.6.0 — the first release that
-# ships the `update` self-update command this agent relies on.
-BUGSEE_CLI_DEFAULT_VERSION = "0.6.0"
+# ships the `update` self-update command this agent relies on. Kept at the
+# current release so a failed self-update (offline, blocked host) still leaves
+# a CLI without the 0.6.0 NDK SYMBOL_TABLE silent-upload bug (bugsee-cli#61).
+BUGSEE_CLI_DEFAULT_VERSION = "0.8.0"
 BUGSEE_CLI_DOWNLOAD_BASE = "https://download.bugsee.com/cli"
 # Strict version-string shape: SemVer-ish `<major>.<minor>.<patch>`
 # optionally followed by `-<prerelease>`. This regex gates any value

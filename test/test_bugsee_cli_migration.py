@@ -1440,7 +1440,7 @@ class TestRunDependenciesPipelineRouting(unittest.TestCase):
 class TestCliVersionValidation(unittest.TestCase):
     def test_default_version_is_floor(self):
         # Pin the download floor so a silent bump surfaces in review.
-        self.assertEqual(agent.BUGSEE_CLI_DEFAULT_VERSION, "0.6.0")
+        self.assertEqual(agent.BUGSEE_CLI_DEFAULT_VERSION, "0.8.0")
 
     def test_accepts_plain_semver_and_prerelease(self):
         self.assertTrue(agent._BUGSEE_CLI_VERSION_RE.fullmatch("0.5.0"))
