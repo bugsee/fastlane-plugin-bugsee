@@ -22,7 +22,7 @@ jobs:
     # the unit tests stub out.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ruby/setup-ruby@v1
         with:
           # Pinned to a Ruby that matches the modern fastlane
@@ -45,7 +45,7 @@ jobs:
   python:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           # BugseeAgent uses only stdlib (no requirements.txt),
@@ -66,7 +66,7 @@ jobs:
     # checked-in or auto-downloaded one.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ruby/setup-ruby@v1
         with:
           # Match the `ruby` job's toolchain so the integration run
