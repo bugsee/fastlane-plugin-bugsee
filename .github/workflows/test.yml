@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           # BugseeAgent uses only stdlib (no requirements.txt),
           # so any 3.10+ Python will do. 3.11 matches the iOS CI
